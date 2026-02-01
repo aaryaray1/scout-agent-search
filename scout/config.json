@@ -1,0 +1,5 @@
+{
+    "vector_model": "all-MiniLM-L6-v2",
+    "corpus_path": "data/corpus.json",
+    "top_k": 3
+}

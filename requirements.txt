@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+sentence-transformers
+qdrant-client
+whoosh
+pydantic
+numpy
+scikit-learn
