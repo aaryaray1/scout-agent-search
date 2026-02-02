@@ -13,8 +13,10 @@ class Query(BaseModel):
 @app.get("/")
 def root():
     return {
-        "status": "Scout API running",
-        "endpoints": ["/api/v1/search (POST)"]
+        "service": "Scout",
+        "status": "running",
+        "docs": "/docs",
+        "redoc": "/redoc"
     }
 
 
