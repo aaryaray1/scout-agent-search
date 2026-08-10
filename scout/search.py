@@ -9,7 +9,7 @@ from .config import load_config
 class Retriever:
     """Hybrid (vector + keyword) retriever over a chunked markdown corpus.
 
-    Loads docs from `docs_path`, chunks them, and embeds them -- reusing the
+    Loads docs from `docs_path`, chunks them, and embeds them, reusing the
     on-disk cache built by `scout.cli` when the corpus hasn't changed
     (`scout.index.compute_corpus_hash`), so `scout-ingest` and the API stay
     in sync on the exact same corpus.
@@ -83,7 +83,7 @@ class Retriever:
         """Embed and append `chunks` to the live in-memory index.
 
         Used by the ingest pipeline (scout.web) so a freshly-fetched page is
-        searchable immediately. This is in-memory only -- it does not touch
+        searchable immediately. This is in-memory only: it does not touch
         the on-disk cache in scout.index, which is a hash-keyed snapshot of
         `docs_path`. Durable storage for ingested pages is Phase 2 work
         (see ROADMAP.md); until then, ingested content doesn't survive a

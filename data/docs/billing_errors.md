@@ -1,6 +1,6 @@
-# Billing Errors – Reference
+# Billing Errors - Reference
 
-## Error 1008 – Insufficient Balance
+## Error 1008 - Insufficient Balance
 
 ### Summary
 Error 1008 indicates that the account does not have sufficient balance to process the request.

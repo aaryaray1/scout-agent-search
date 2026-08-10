@@ -1,6 +1,6 @@
 # MiniMax API Errors
 
-## Error 1001 – Invalid Request Format
+## Error 1001 - Invalid Request Format
 
 ### Summary
 Error 1001 occurs when the request payload does not match the expected API schema.
@@ -19,7 +19,7 @@ Missing required fields or invalid JSON formatting.
 
 ---
 
-## Error 1008 – Insufficient Balance
+## Error 1008 - Insufficient Balance
 
 ### Summary
 Error 1008 indicates insufficient billing balance to process the request.
@@ -37,7 +37,7 @@ This error blocks all billable endpoints until resolved.
 
 ---
 
-## Error 1020 – Rate Limit Exceeded
+## Error 1020 - Rate Limit Exceeded
 
 ### Summary
 Error 1020 occurs when request volume exceeds the allowed rate limit.

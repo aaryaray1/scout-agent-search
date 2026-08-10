@@ -34,7 +34,7 @@ def search_endpoint(q: SearchRequest):
 @app.post("/api/v1/ingest", response_model=IngestResponse)
 def ingest_endpoint(req: IngestRequest):
     """Convert a web page (fetched by URL, or handed to us as raw HTML)
-    straight into structured JSON -- the conversion step agents otherwise
+    straight into structured JSON: the conversion step agents otherwise
     have to do themselves. Also indexes the result so it's immediately
     searchable via /api/v1/search (in-memory only; see ROADMAP.md Phase 2
     for durable storage of ingested pages).

@@ -1,65 +1,36 @@
 # Scout
 
-Scout is a search engine built **for agents, not browsers**.
+Search built for agents, not browsers.
 
-## The problem
+## Why
 
-When an agent needs information from the web, it typically fetches a page as
-raw HTML and then has to parse, clean, and restructure that HTML into
-something a model can actually reason over (usually JSON) before it's useful.
-That conversion step is repeated by every agent, on every fetch, and it costs
-real time and tokens.
+An agent that pulls information from the web gets raw HTML back and has to parse it into something usable before it can reason over it. Every agent repeats that step, on every fetch. Scout does it once and returns structured JSON instead of markup.
 
-Scout's goal is to remove that step entirely: agents query Scout and get
-back **pre-structured JSON evidence** — ranked, sourced, and ready to use —
-instead of a blob of markup they have to parse themselves.
+## What's here
 
-## What's implemented today
+- Local hybrid search (vector + keyword) over a markdown corpus: `scout/ingest.py`, `scout/embeddings.py`, `scout/index.py`, `scout/search.py`. Served as `POST /api/v1/search`.
+- HTML ingestion: fetch a URL or accept raw HTML, extract clean content with `trafilatura`, chunk it, index it. `scout/fetch.py`, `scout/webextract.py`, `scout/web.py`. Served as `POST /api/v1/ingest`.
 
-The current prototype is the retrieval half of that pipeline: a hybrid
-(vector + keyword) search engine over a corpus of markdown documents.
-
-- **Ingestion** ([scout/ingest.py](scout/ingest.py)) — loads markdown files, chunks them with overlap.
-- **Embeddings** ([scout/embeddings.py](scout/embeddings.py)) — sentence-transformer vector encoding.
-- **Indexing** ([scout/index.py](scout/index.py)) — caches embeddings to disk, keyed by a hash of the corpus so re-ingesting unchanged docs is a no-op.
-- **Search** ([scout/search.py](scout/search.py)) — cosine similarity + keyword overlap, fused into one confidence score, returned as evidence objects.
-- **API** ([scout/api.py](scout/api.py)) — a small FastAPI service exposing `/api/v1/search`.
-
-A first pass at the actual point of the project — turning a live web page
-into structured JSON instead of leaving that to the agent — now exists too:
-
-- **Fetch** ([scout/fetch.py](scout/fetch.py)) — SSRF-guarded HTTP fetcher.
-- **Extract** ([scout/webextract.py](scout/webextract.py)) — HTML → clean markdown + metadata via `trafilatura`.
-- **Ingest API** ([scout/api.py](scout/api.py)) — `POST /api/v1/ingest` takes a `url` (or raw `html` + `source_url`), returns structured JSON immediately, and indexes it in-memory so it's searchable right away.
-
-It's a first pass, not a finished pipeline — see [ROADMAP.md](ROADMAP.md) for
-what's still open (durable storage for ingested pages, JS-rendered pages,
-richer structure beyond markdown).
+Ingestion is a first pass, not a finished pipeline. See [ROADMAP.md](ROADMAP.md) for what's missing (durable storage for ingested pages, JS-rendered pages, richer structure).
 
 ## Quickstart
 
 ```bash
-# from the repo root
 python -m venv .venv
 .venv\Scripts\activate        # Windows
 pip install -e ".[dev]"
 
-# build the search index from data/docs
-scout-ingest
-
-# run the API
+scout-ingest                  # build the index from data/docs
 uvicorn scout.api:app --reload
 ```
 
-Then query it:
+Search:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/api/v1/search \
   -H "Content-Type: application/json" \
   -d '{"query": "rate limit exceeded", "top_k": 2}'
 ```
-
-Response shape:
 
 ```json
 {
@@ -76,8 +47,7 @@ Response shape:
 }
 ```
 
-Or hand it a live page instead of pre-built docs — this is the part meant to
-replace an agent's own HTML → JSON step:
+Ingest a live page instead of pre-built docs:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/api/v1/ingest \
@@ -85,37 +55,31 @@ curl -X POST http://127.0.0.1:8000/api/v1/ingest \
   -d '{"url": "https://example.com/some/docs/page"}'
 ```
 
-which returns structured content directly and makes it searchable
-immediately (see [ROADMAP.md](ROADMAP.md) for current limits, notably: this
-index is in-memory only and won't survive a restart yet).
+Returns structured content directly and indexes it for immediate search. The index is in-memory only and won't survive a restart yet (see ROADMAP.md).
 
 ## Configuration
 
-Defaults (embedding model, docs path, `top_k`, score-fusion weights) live in
-[scout/config.json](scout/config.json) and are loaded via
-[scout/config.py](scout/config.py).
+Defaults (embedding model, docs path, `top_k`, score-fusion weights) live in `scout/config.json`, loaded via `scout/config.py`.
 
-## Running tests
+## Tests
 
 ```bash
 pytest
 ```
 
-## Project layout
+## Layout
 
 ```
-scout/          the package: ingest, embed, index, search, api, cli
-data/docs/      markdown source documents (the demo corpus)
-data/index/     generated embedding cache (git-ignored, rebuilt by scout-ingest)
+scout/          package: ingest, embed, index, search, fetch, webextract, web, api, cli
+data/docs/      markdown source documents (demo corpus)
+data/index/     generated embedding cache, git-ignored
 tests/          pytest suite
 ```
 
 ## License
 
-Not yet chosen - this repo isn't licensed for reuse until a LICENSE file is
-added.
+Apache License 2.0. See [LICENSE](LICENSE).
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md) for what's next, starting with the HTML→JSON
-ingestion pipeline that's the actual point of this project.
+See [ROADMAP.md](ROADMAP.md).

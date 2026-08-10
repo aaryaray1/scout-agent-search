@@ -12,8 +12,8 @@ from .ingest import doc_from_web_content, chunk_docs
 def ingest_url(url):
     """Fetch `url`, extract its main content, and return it chunked.
 
-    Returns (title, metadata, chunks) -- chunks match the same shape
-    produced for the local markdown corpus, so they're ready for
+    Returns (title, metadata, chunks). chunks match the same shape produced
+    for the local markdown corpus, so they're ready for
     Retriever.add_chunks() or direct serialization.
     """
     html = fetch_html(url)

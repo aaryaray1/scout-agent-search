@@ -3,9 +3,9 @@
 This fetches arbitrary URLs on behalf of callers, which is real attack
 surface (SSRF): a caller could ask Scout to request internal services,
 cloud metadata endpoints, etc. The guards below are a first pass, not a
-complete answer -- see ROADMAP.md's "Security notes" for known gaps
-(notably DNS rebinding: the host is validated at resolution time, not at
-the moment of connection).
+complete answer. See ROADMAP.md's "Security notes" for known gaps, notably
+DNS rebinding: the host is validated at resolution time, not at the moment
+of connection.
 """
 import ipaddress
 import socket
