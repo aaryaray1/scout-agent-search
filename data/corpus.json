@@ -1,5 +1,0 @@
-[
-    {"id": "1", "content": "Error 1008 means insufficient balance."},
-    {"id": "2", "content": "MiniMax API keys require a funded account."},
-    {"id": "3", "content": "OpenClaw agents can parse JSON evidence objects."}
-]

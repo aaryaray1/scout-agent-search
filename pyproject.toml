@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scout-agent-search"
+version = "0.1.0"
+description = "A search engine that returns pre-structured JSON evidence, so agents never have to parse HTML themselves."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "sentence-transformers",
+    "pydantic",
+    "numpy",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "httpx"]
+
+[project.scripts]
+scout-ingest = "scout.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["scout*"]
