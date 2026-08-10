@@ -14,6 +14,8 @@ dependencies = [
     "sentence-transformers",
     "pydantic",
     "numpy",
+    "httpx",
+    "trafilatura",
 ]
 
 [project.optional-dependencies]

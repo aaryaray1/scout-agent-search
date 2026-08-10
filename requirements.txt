@@ -3,3 +3,5 @@ uvicorn
 sentence-transformers
 pydantic
 numpy
+httpx
+trafilatura

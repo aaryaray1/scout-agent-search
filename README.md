@@ -25,9 +25,16 @@ The current prototype is the retrieval half of that pipeline: a hybrid
 - **Search** ([scout/search.py](scout/search.py)) — cosine similarity + keyword overlap, fused into one confidence score, returned as evidence objects.
 - **API** ([scout/api.py](scout/api.py)) — a small FastAPI service exposing `/api/v1/search`.
 
-The HTML-ingestion half — fetching a live page or accepting raw HTML and
-turning it into the same structured evidence format — doesn't exist yet.
-See [ROADMAP.md](ROADMAP.md) for the plan to build it.
+A first pass at the actual point of the project — turning a live web page
+into structured JSON instead of leaving that to the agent — now exists too:
+
+- **Fetch** ([scout/fetch.py](scout/fetch.py)) — SSRF-guarded HTTP fetcher.
+- **Extract** ([scout/webextract.py](scout/webextract.py)) — HTML → clean markdown + metadata via `trafilatura`.
+- **Ingest API** ([scout/api.py](scout/api.py)) — `POST /api/v1/ingest` takes a `url` (or raw `html` + `source_url`), returns structured JSON immediately, and indexes it in-memory so it's searchable right away.
+
+It's a first pass, not a finished pipeline — see [ROADMAP.md](ROADMAP.md) for
+what's still open (durable storage for ingested pages, JS-rendered pages,
+richer structure beyond markdown).
 
 ## Quickstart
 
@@ -69,6 +76,19 @@ Response shape:
 }
 ```
 
+Or hand it a live page instead of pre-built docs — this is the part meant to
+replace an agent's own HTML → JSON step:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/v1/ingest \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://example.com/some/docs/page"}'
+```
+
+which returns structured content directly and makes it searchable
+immediately (see [ROADMAP.md](ROADMAP.md) for current limits, notably: this
+index is in-memory only and won't survive a restart yet).
+
 ## Configuration
 
 Defaults (embedding model, docs path, `top_k`, score-fusion weights) live in
@@ -92,7 +112,7 @@ tests/          pytest suite
 
 ## License
 
-Not yet chosen — this repo isn't licensed for reuse until a LICENSE file is
+Not yet chosen - this repo isn't licensed for reuse until a LICENSE file is
 added.
 
 ## Roadmap

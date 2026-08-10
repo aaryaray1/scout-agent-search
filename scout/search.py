@@ -78,3 +78,19 @@ class Retriever:
 
         results.sort(key=lambda x: x["confidence"], reverse=True)
         return results[:top_k]
+
+    def add_chunks(self, chunks):
+        """Embed and append `chunks` to the live in-memory index.
+
+        Used by the ingest pipeline (scout.web) so a freshly-fetched page is
+        searchable immediately. This is in-memory only -- it does not touch
+        the on-disk cache in scout.index, which is a hash-keyed snapshot of
+        `docs_path`. Durable storage for ingested pages is Phase 2 work
+        (see ROADMAP.md); until then, ingested content doesn't survive a
+        process restart.
+        """
+        if not chunks:
+            return
+        new_embeddings = self.embed_model.encode([c["content"] for c in chunks])
+        self.corpus.extend(chunks)
+        self.corpus_embeddings = np.vstack([self.corpus_embeddings, new_embeddings])
