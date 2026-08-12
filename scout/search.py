@@ -1,7 +1,7 @@
 import numpy as np
 from .embeddings import EmbeddingModel
 from .ingest import load_markdown_docs, chunk_docs
-from .keyword import keyword_score
+from .keyword import tokenize, score_tokens
 from .index import load_index, save_index, compute_corpus_hash
 from .config import load_config
 
@@ -32,6 +32,12 @@ class Retriever:
                 "Add markdown files or point docs_path at a populated folder."
             )
 
+        # Tokenized once per document here, not per query: keyword_score
+        # would otherwise re-tokenize every chunk's full text on every
+        # search() call, which is wasted work since the corpus is static
+        # between ingests.
+        self._doc_tokens = [tokenize(d["content"]) for d in self.corpus]
+
         current_hash = compute_corpus_hash(self.corpus)
 
         cached = load_index()
@@ -49,6 +55,7 @@ class Retriever:
     def search(self, query, top_k=None):
         top_k = top_k or self.top_k
         query_vec = self.embed_model.encode([query])[0]
+        query_tokens = tokenize(query)
 
         # Vectorized cosine similarity against the whole corpus at once.
         doc_norms = np.linalg.norm(self.corpus_embeddings, axis=1)
@@ -58,8 +65,8 @@ class Retriever:
         vector_sims = (self.corpus_embeddings @ query_vec) / denom
 
         results = []
-        for doc, vector_sim in zip(self.corpus, vector_sims):
-            key_sim = keyword_score(query, doc["content"])
+        for doc, doc_tokens, vector_sim in zip(self.corpus, self._doc_tokens, vector_sims):
+            key_sim = score_tokens(query_tokens, doc_tokens)
             final_score = (
                 self.vector_weight * vector_sim +
                 self.keyword_weight * key_sim
@@ -93,4 +100,5 @@ class Retriever:
             return
         new_embeddings = self.embed_model.encode([c["content"] for c in chunks])
         self.corpus.extend(chunks)
+        self._doc_tokens.extend(tokenize(c["content"]) for c in chunks)
         self.corpus_embeddings = np.vstack([self.corpus_embeddings, new_embeddings])

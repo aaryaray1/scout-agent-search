@@ -7,9 +7,10 @@ Ordered by dependency, not strictly by priority. Phase 1 is the actual point of 
 A hybrid vector + keyword retriever over a local markdown corpus, a FastAPI search endpoint, a CLI to build/refresh the index. Exists mainly to prove out retrieval and scoring before ingestion. Known limitations, carried into later phases:
 
 - In-memory linear scan over `numpy` arrays - fine for a demo corpus, won't hold up past a few thousand chunks.
-- Keyword scoring is raw token overlap (`scout/keyword.py`), not BM25/TF-IDF. Cheap, weak on rare-term weighting.
+- Keyword scoring is raw token overlap (`scout/keyword.py`), not BM25/TF-IDF. Cheap, weak on rare-term weighting. Documents are now tokenized once per corpus build/ingest rather than re-tokenized on every query (`Retriever._doc_tokens`), so this is a scoring-quality gap, not a performance one.
 - Score fusion weights (`vector_weight`/`keyword_weight` in `config.json`) are guessed, not tuned against a labeled relevance set.
 - Fixed-size word chunking (`chunk_text`) ignores document structure and can split mid-section. Chunking by heading would preserve more meaning per chunk.
+- `Retriever()` reloads the embedding model from disk on every instantiation with no shared cache across instances; the test suite pays for this on every test that constructs one. Worth a session-scoped fixture or a process-wide model singleton.
 
 ## Phase 1 - HTML to JSON ingestion (the actual differentiator)
 
@@ -27,8 +28,9 @@ Open before this is production-ready:
 - No structure beyond markdown text. Tables, code blocks, and links are currently discarded (`include_links=False`, `include_images=False` in `webextract.py`). Worth revisiting once there's a concrete need for them.
 - SSRF guard checks at DNS resolution time, not connection time. A DNS-rebinding attack (host resolves safely during the check, then re-resolves to a private IP for the actual connection) isn't covered. Low risk while self-hosted, should be closed before any multi-tenant exposure.
 - JS-rendered pages return nothing, since `trafilatura` only sees the HTML as served. A headless-browser fallback is a deliberate future decision, not a default, given the sandboxing it needs.
-- No content-type validation before parsing. A non-HTML response served with a 200 (a PDF, a JSON error page) currently just fails extraction with a generic `ValueError`.
 - The evidence schema in `scout/models.py` isn't versioned. It now covers both search and ingest responses, but nothing stops it drifting as the code evolves.
+
+Closed since the first pass: content-type validation now runs in `scout/fetch.py` before extraction, so a non-HTML response (a PDF, a JSON error page served with a 200) fails fast with a specific error instead of a generic `ValueError` further down the pipeline.
 
 ## Phase 2 - storage that scales past a demo corpus
 

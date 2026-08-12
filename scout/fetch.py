@@ -67,6 +67,22 @@ def _validate_url(url: str) -> str:
     return url
 
 
+def _assert_html_content_type(response) -> None:
+    """Reject non-HTML responses (PDFs, JSON error pages served with a 200,
+    images, etc.) before handing them to the extractor, which would
+    otherwise fail with a generic "no extractable content" error further
+    down the pipeline.
+    """
+    content_type = response.headers.get("content-type", "")
+    if not content_type:
+        return  # some servers omit it; nothing to validate against
+    main_type = content_type.split(";")[0].strip().lower()
+    if "html" not in main_type:
+        raise FetchError(
+            f"expected an HTML response, got content-type '{main_type}'"
+        )
+
+
 def fetch_html(url: str, timeout: float = DEFAULT_TIMEOUT, max_bytes: int = MAX_RESPONSE_BYTES) -> str:
     """Fetch `url` and return its response body as text.
 
@@ -92,6 +108,7 @@ def fetch_html(url: str, timeout: float = DEFAULT_TIMEOUT, max_bytes: int = MAX_
                 redirects += 1
 
             response.raise_for_status()
+            _assert_html_content_type(response)
 
             content_length = response.headers.get("content-length")
             if content_length and int(content_length) > max_bytes:
