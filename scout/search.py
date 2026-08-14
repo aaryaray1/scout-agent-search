@@ -2,7 +2,7 @@ import numpy as np
 from .embeddings import EmbeddingModel
 from .ingest import load_markdown_docs, chunk_docs
 from .keyword import tokenize, score_tokens
-from .index import load_index, save_index, compute_corpus_hash
+from .index import load_index, save_index, compute_corpus_hash, load_ingested, save_ingested
 from .config import load_config
 
 
@@ -12,7 +12,9 @@ class Retriever:
     Loads docs from `docs_path`, chunks them, and embeds them, reusing the
     on-disk cache built by `scout.cli` when the corpus hasn't changed
     (`scout.index.compute_corpus_hash`), so `scout-ingest` and the API stay
-    in sync on the exact same corpus.
+    in sync on the exact same corpus. Also reloads any pages previously
+    added through add_chunks()/`/api/v1/ingest` from scout.index's ingested
+    store, so those survive a restart too.
     """
 
     def __init__(self, docs_path=None, top_k=None):
@@ -45,12 +47,29 @@ class Retriever:
             embeddings, metadata, cached_hash = cached
             if cached_hash == current_hash:
                 self.corpus_embeddings = embeddings
+                self._load_persisted_ingest()
                 return
 
         self.corpus_embeddings = self.embed_model.encode(
             [d["content"] for d in self.corpus]
         )
         save_index(self.corpus_embeddings, self.corpus, current_hash)
+        self._load_persisted_ingest()
+
+    def _load_persisted_ingest(self):
+        """Fold previously-ingested pages back into the live corpus on
+        startup, so content added through /api/v1/ingest survives a
+        restart instead of only living in memory for one process.
+        """
+        ingested = load_ingested()
+        if ingested:
+            self._ingested_embeddings, self._ingested_chunks = ingested
+            self.corpus.extend(self._ingested_chunks)
+            self._doc_tokens.extend(tokenize(c["content"]) for c in self._ingested_chunks)
+            self.corpus_embeddings = np.vstack([self.corpus_embeddings, self._ingested_embeddings])
+        else:
+            self._ingested_chunks = []
+            self._ingested_embeddings = np.empty((0, self.corpus_embeddings.shape[1]))
 
     def search(self, query, top_k=None):
         top_k = top_k or self.top_k
@@ -87,14 +106,16 @@ class Retriever:
         return results[:top_k]
 
     def add_chunks(self, chunks):
-        """Embed and append `chunks` to the live in-memory index.
+        """Embed and append `chunks` to the live index, and persist them.
 
         Used by the ingest pipeline (scout.web) so a freshly-fetched page is
-        searchable immediately. This is in-memory only: it does not touch
-        the on-disk cache in scout.index, which is a hash-keyed snapshot of
-        `docs_path`. Durable storage for ingested pages is Phase 2 work
-        (see ROADMAP.md); until then, ingested content doesn't survive a
-        process restart.
+        searchable immediately. Ingested chunks are written to
+        scout.index's ingested store on every call, so they're reloaded by
+        `_load_persisted_ingest()` the next time a Retriever starts up and
+        survive a process restart. This isn't the real Phase 2 vector store
+        (see ROADMAP.md): every call rewrites the whole ingested store to
+        disk, which is fine at prototype scale but not how this should work
+        once ingest volume grows.
         """
         if not chunks:
             return
@@ -102,3 +123,7 @@ class Retriever:
         self.corpus.extend(chunks)
         self._doc_tokens.extend(tokenize(c["content"]) for c in chunks)
         self.corpus_embeddings = np.vstack([self.corpus_embeddings, new_embeddings])
+
+        self._ingested_chunks.extend(chunks)
+        self._ingested_embeddings = np.vstack([self._ingested_embeddings, new_embeddings])
+        save_ingested(self._ingested_embeddings, self._ingested_chunks)
