@@ -9,12 +9,20 @@ from .config import load_config
 class Retriever:
     """Hybrid (vector + keyword) retriever over a chunked markdown corpus.
 
-    Loads docs from `docs_path`, chunks them, and embeds them, reusing the
-    on-disk cache built by `scout.cli` when the corpus hasn't changed
-    (`scout.index.compute_corpus_hash`), so `scout-ingest` and the API stay
-    in sync on the exact same corpus. Also reloads any pages previously
-    added through add_chunks()/`/api/v1/ingest` from scout.index's ingested
-    store, so those survive a restart too.
+    The live corpus is two layers concatenated together:
+
+    - the docs_path corpus (self._docs_*): loaded once at startup, cached
+      to disk by content hash (scout.index.compute_corpus_hash), so
+      scout-ingest and the API stay in sync on the exact same corpus.
+    - the ingested corpus (self._ingested_*): pages added later through
+      add_chunks()/`/api/v1/ingest`, persisted so they survive a restart.
+
+    self.corpus / self._doc_tokens / self.corpus_embeddings are the
+    concatenation of both layers, recomputed by _rebuild_combined_corpus()
+    whenever either layer changes. Keeping them as two separate layers
+    (rather than one flat list) is what makes de-duplication on re-ingest
+    tractable: dropping a stale source only ever touches the ingested
+    layer, never the docs_path corpus.
     """
 
     def __init__(self, docs_path=None, top_k=None):
@@ -27,8 +35,8 @@ class Retriever:
         self.embed_model = EmbeddingModel(config["vector_model"])
 
         raw_docs = load_markdown_docs(self.docs_path)
-        self.corpus = chunk_docs(raw_docs)
-        if not self.corpus:
+        docs_corpus = chunk_docs(raw_docs)
+        if not docs_corpus:
             raise ValueError(
                 f"No documents found under '{self.docs_path}'. "
                 "Add markdown files or point docs_path at a populated folder."
@@ -36,40 +44,64 @@ class Retriever:
 
         # Tokenized once per document here, not per query: keyword_score
         # would otherwise re-tokenize every chunk's full text on every
-        # search() call, which is wasted work since the corpus is static
-        # between ingests.
-        self._doc_tokens = [tokenize(d["content"]) for d in self.corpus]
+        # search() call, which is wasted work since a given chunk's text
+        # doesn't change between queries.
+        docs_doc_tokens = [tokenize(d["content"]) for d in docs_corpus]
 
-        current_hash = compute_corpus_hash(self.corpus)
-
+        current_hash = compute_corpus_hash(docs_corpus)
         cached = load_index()
-        if cached:
-            embeddings, metadata, cached_hash = cached
-            if cached_hash == current_hash:
-                self.corpus_embeddings = embeddings
-                self._load_persisted_ingest()
-                return
+        if cached and cached[2] == current_hash:
+            docs_embeddings = cached[0]
+        else:
+            docs_embeddings = self.embed_model.encode(
+                [d["content"] for d in docs_corpus]
+            )
+            save_index(docs_embeddings, docs_corpus, current_hash)
 
-        self.corpus_embeddings = self.embed_model.encode(
-            [d["content"] for d in self.corpus]
-        )
-        save_index(self.corpus_embeddings, self.corpus, current_hash)
+        self._docs_corpus = docs_corpus
+        self._docs_doc_tokens = docs_doc_tokens
+        self._docs_embeddings = docs_embeddings
+
         self._load_persisted_ingest()
 
     def _load_persisted_ingest(self):
-        """Fold previously-ingested pages back into the live corpus on
-        startup, so content added through /api/v1/ingest survives a
-        restart instead of only living in memory for one process.
+        """Load the ingested layer from disk (or start it empty) and fold
+        it into the live corpus, so content added through /api/v1/ingest
+        survives a restart instead of only living in memory for one
+        process.
         """
         ingested = load_ingested()
         if ingested:
-            self._ingested_embeddings, self._ingested_chunks = ingested
-            self.corpus.extend(self._ingested_chunks)
-            self._doc_tokens.extend(tokenize(c["content"]) for c in self._ingested_chunks)
-            self.corpus_embeddings = np.vstack([self.corpus_embeddings, self._ingested_embeddings])
+            embeddings, chunks = ingested
+            self._ingested_chunks = chunks
+            self._ingested_doc_tokens = [tokenize(c["content"]) for c in chunks]
+            self._ingested_embeddings = embeddings
         else:
             self._ingested_chunks = []
-            self._ingested_embeddings = np.empty((0, self.corpus_embeddings.shape[1]))
+            self._ingested_doc_tokens = []
+            self._ingested_embeddings = np.empty((0, self._docs_embeddings.shape[1]))
+        self._rebuild_combined_corpus()
+
+    def _rebuild_combined_corpus(self):
+        self.corpus = self._docs_corpus + self._ingested_chunks
+        self._doc_tokens = self._docs_doc_tokens + self._ingested_doc_tokens
+        self.corpus_embeddings = np.vstack([self._docs_embeddings, self._ingested_embeddings])
+
+    def _drop_ingested_sources(self, sources):
+        """Remove any already-ingested chunks whose source is in `sources`.
+
+        Called before adding new chunks for a page, so re-ingesting a URL
+        replaces its old content instead of accumulating duplicate chunks
+        alongside it forever in the persisted store.
+        """
+        if not self._ingested_chunks:
+            return
+        keep = [c["source"] not in sources for c in self._ingested_chunks]
+        if all(keep):
+            return
+        self._ingested_chunks = [c for c, k in zip(self._ingested_chunks, keep) if k]
+        self._ingested_doc_tokens = [t for t, k in zip(self._ingested_doc_tokens, keep) if k]
+        self._ingested_embeddings = self._ingested_embeddings[keep]
 
     def search(self, query, top_k=None):
         top_k = top_k or self.top_k
@@ -106,24 +138,28 @@ class Retriever:
         return results[:top_k]
 
     def add_chunks(self, chunks):
-        """Embed and append `chunks` to the live index, and persist them.
+        """Embed `chunks`, replace any existing chunks that share a
+        source, and persist the result.
 
-        Used by the ingest pipeline (scout.web) so a freshly-fetched page is
-        searchable immediately. Ingested chunks are written to
-        scout.index's ingested store on every call, so they're reloaded by
-        `_load_persisted_ingest()` the next time a Retriever starts up and
-        survive a process restart. This isn't the real Phase 2 vector store
-        (see ROADMAP.md): every call rewrites the whole ingested store to
-        disk, which is fine at prototype scale but not how this should work
-        once ingest volume grows.
+        Used by the ingest pipeline (scout.web) so a freshly-fetched page
+        is searchable immediately. Re-ingesting a URL that's already in the
+        ingested store drops its old chunks first, so the store holds one
+        version per source instead of piling up duplicates. This still
+        isn't the real Phase 2 vector store (see ROADMAP.md): every call
+        rewrites the whole ingested store to disk, which is fine at
+        prototype scale but not how this should work once ingest volume
+        grows.
         """
         if not chunks:
             return
-        new_embeddings = self.embed_model.encode([c["content"] for c in chunks])
-        self.corpus.extend(chunks)
-        self._doc_tokens.extend(tokenize(c["content"]) for c in chunks)
-        self.corpus_embeddings = np.vstack([self.corpus_embeddings, new_embeddings])
 
+        sources = {c["source"] for c in chunks}
+        self._drop_ingested_sources(sources)
+
+        new_embeddings = self.embed_model.encode([c["content"] for c in chunks])
         self._ingested_chunks.extend(chunks)
+        self._ingested_doc_tokens.extend(tokenize(c["content"]) for c in chunks)
         self._ingested_embeddings = np.vstack([self._ingested_embeddings, new_embeddings])
+
         save_ingested(self._ingested_embeddings, self._ingested_chunks)
+        self._rebuild_combined_corpus()

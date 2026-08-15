@@ -21,7 +21,7 @@ First pass scaffolded. `POST /api/v1/ingest` takes `{"url": ...}` (Scout fetches
 - **Extractor** (`scout/webextract.py`): delegates to `trafilatura` for boilerplate removal, asks for markdown output plus title/author/date/sitename metadata.
 - **Normalizer** (`scout/ingest.py::doc_from_web_content`): wraps extracted content in the same doc shape `load_markdown_docs()` produces, so it flows through `chunk_docs()` unchanged.
 - **Orchestration** (`scout/web.py`): ties fetch, extract, and chunk together as `ingest_url()` / `ingest_html()`.
-- **Retriever.add_chunks()**: embeds and appends new chunks to the live in-memory corpus/embeddings array.
+- **Retriever.add_chunks()**: embeds new chunks, drops any existing ingested chunks with a matching source, and persists the result, so re-ingesting a URL updates it in place instead of duplicating it.
 
 Open before this is production-ready:
 
@@ -33,14 +33,15 @@ Open before this is production-ready:
 Closed since the first pass:
 
 - Content-type validation now runs in `scout/fetch.py` before extraction, so a non-HTML response (a PDF, a JSON error page served with a 200) fails fast with a specific error instead of a generic `ValueError` further down the pipeline.
-- Ingested pages now survive a restart. `add_chunks()` persists new chunks and embeddings through `scout/index.py::save_ingested`, and `Retriever.__init__` reloads them via `load_ingested()` on startup. Verified live: ingested a page, killed the server process, restarted it, and the content was still searchable with no re-ingest. This is a stepping stone, not the real Phase 2 store: every ingest rewrites the entire ingested store to disk, and there's still no de-duplication (Phase 2).
+- Ingested pages now survive a restart. `add_chunks()` persists new chunks and embeddings through `scout/index.py::save_ingested`, and `Retriever.__init__` reloads them via `load_ingested()` on startup. Verified live: ingested a page, killed the server process, restarted it, and the content was still searchable with no re-ingest. This is a stepping stone, not the real Phase 2 store: every ingest rewrites the entire ingested store to disk.
+- Re-ingesting the same URL now replaces its old chunks instead of piling up duplicates alongside them. `Retriever` tracks the docs_path corpus and the ingested corpus as two separate layers (`_docs_*` / `_ingested_*`) concatenated into the live `self.corpus`; `add_chunks()` drops any existing ingested chunks matching the incoming chunks' `source` before adding the new ones. Verified live: ingested the same URL twice with different content, `corpus_size` stayed the same both times, and only the latest version was searchable, including after a restart. Only covers exact same-URL re-ingestion, not near-duplicate content from different URLs (Phase 2).
 
 ## Phase 2 - storage that scales past a demo corpus
 
 - Swap the flat `numpy` array and JSON metadata cache (now including the ingested-pages store added in Phase 1) for a real vector store. `qdrant-client` sat in requirements.txt early in the project's history, which suggests it was the original intent. Either bring it back deliberately (e.g. via `docker-compose` for local dev) or document a different choice.
 - Add a `whoosh`-style inverted index for the keyword half of hybrid search, replacing the current set-intersection scoring.
-- Incremental indexing. Right now any corpus change forces a full re-embed, and every ingest rewrites the entire ingested store to disk; ingested pages should be upsertable by source URL/hash without rebuilding everything.
-- De-duplication. Re-ingesting the same URL, or near-duplicate content, shouldn't create redundant chunks.
+- True incremental indexing. The docs_path corpus still forces a full re-embed on any change, and every ingest rewrites the entire ingested store to disk and rebuilds the combined in-memory corpus, even though only one source's worth of chunks actually changed.
+- Near-duplicate detection across different URLs. Exact same-URL re-ingestion is now handled (Phase 1); two different URLs serving the same or near-identical content still produce separate chunks.
 
 ## Phase 3 - API and agent-facing ergonomics
 

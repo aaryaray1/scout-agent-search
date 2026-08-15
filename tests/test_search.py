@@ -62,3 +62,66 @@ def test_ingested_content_survives_a_new_retriever_instance():
     assert len(second.corpus) == before + 1
     results = second.search("widget frobnication error 4242", top_k=1)
     assert results[0]["source"] == "https://example.com/persisted"
+
+
+def test_re_ingesting_same_source_replaces_instead_of_duplicating():
+    retriever = Retriever()
+    before = len(retriever.corpus)
+    source = "https://example.com/changelog"
+
+    retriever.add_chunks([{
+        "id": "dedup-v1",
+        "content": "Version 1.0 released with initial widget support.",
+        "source": source,
+        "type": "web",
+        "order": 0,
+    }])
+    assert len(retriever.corpus) == before + 1
+
+    # Re-ingesting the same source should replace its chunk, not add a
+    # second one alongside it.
+    retriever.add_chunks([{
+        "id": "dedup-v2",
+        "content": "Version 2.0 released with frobnication support.",
+        "source": source,
+        "type": "web",
+        "order": 0,
+    }])
+    assert len(retriever.corpus) == before + 1
+    assert len(retriever._doc_tokens) == len(retriever.corpus)
+    assert retriever.corpus_embeddings.shape[0] == len(retriever.corpus)
+
+    results = retriever.search("frobnication support version 2.0", top_k=1)
+    assert results[0]["source"] == source
+    assert "2.0" in results[0]["content"]
+
+    # the stale v1.0 content should be gone, not just outranked
+    all_content = " ".join(c["content"] for c in retriever.corpus)
+    assert "initial widget support" not in all_content
+
+
+def test_dedup_persists_correctly_across_restart():
+    source = "https://example.com/changelog"
+    first = Retriever()
+    before = len(first.corpus)
+
+    first.add_chunks([{
+        "id": "dedup-r1",
+        "content": "Version 1.0 release notes for the frobnicator.",
+        "source": source,
+        "type": "web",
+        "order": 0,
+    }])
+    first.add_chunks([{
+        "id": "dedup-r2",
+        "content": "Version 2.0 release notes for the frobnicator.",
+        "source": source,
+        "type": "web",
+        "order": 0,
+    }])
+    assert len(first.corpus) == before + 1
+
+    second = Retriever()
+    assert len(second.corpus) == before + 1
+    results = second.search("frobnicator version 2.0 release notes", top_k=1)
+    assert "2.0" in results[0]["content"]
