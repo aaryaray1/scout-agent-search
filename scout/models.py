@@ -1,6 +1,11 @@
 from pydantic import BaseModel, model_validator
 from typing import List, Dict, Optional
 
+# Bump this on any breaking change to Evidence/SearchResponse/IngestResponse
+# shape, so agents consuming these responses have something concrete to
+# check compatibility against instead of guessing from field presence.
+EVIDENCE_SCHEMA_VERSION = "1.0"
+
 
 class SearchRequest(BaseModel):
     query: str
@@ -23,6 +28,7 @@ class Evidence(BaseModel):
 
 
 class SearchResponse(BaseModel):
+    schema_version: str = EVIDENCE_SCHEMA_VERSION
     query: str
     results: List[Evidence]
 
@@ -50,6 +56,7 @@ class IngestChunk(BaseModel):
 
 
 class IngestResponse(BaseModel):
+    schema_version: str = EVIDENCE_SCHEMA_VERSION
     url: str
     title: str
     type: str = "web"

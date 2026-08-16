@@ -1,13 +1,14 @@
 import numpy as np
 from .embeddings import EmbeddingModel
 from .ingest import load_markdown_docs, chunk_docs
-from .keyword import tokenize, score_tokens
+from .bm25 import BM25Index, normalize
 from .index import load_index, save_index, compute_corpus_hash, load_ingested, save_ingested
 from .config import load_config
 
 
 class Retriever:
-    """Hybrid (vector + keyword) retriever over a chunked markdown corpus.
+    """Hybrid (vector + BM25 keyword) retriever over a chunked markdown
+    corpus.
 
     The live corpus is two layers concatenated together:
 
@@ -17,12 +18,12 @@ class Retriever:
     - the ingested corpus (self._ingested_*): pages added later through
       add_chunks()/`/api/v1/ingest`, persisted so they survive a restart.
 
-    self.corpus / self._doc_tokens / self.corpus_embeddings are the
-    concatenation of both layers, recomputed by _rebuild_combined_corpus()
-    whenever either layer changes. Keeping them as two separate layers
-    (rather than one flat list) is what makes de-duplication on re-ingest
-    tractable: dropping a stale source only ever touches the ingested
-    layer, never the docs_path corpus.
+    self.corpus / self.corpus_embeddings / self._bm25 are derived from
+    both layers, recomputed by _rebuild_combined_corpus() whenever either
+    layer changes. Keeping them as two separate layers (rather than one
+    flat list) is what makes de-duplication on re-ingest tractable:
+    dropping a stale source only ever touches the ingested layer, never
+    the docs_path corpus.
     """
 
     def __init__(self, docs_path=None, top_k=None):
@@ -42,12 +43,6 @@ class Retriever:
                 "Add markdown files or point docs_path at a populated folder."
             )
 
-        # Tokenized once per document here, not per query: keyword_score
-        # would otherwise re-tokenize every chunk's full text on every
-        # search() call, which is wasted work since a given chunk's text
-        # doesn't change between queries.
-        docs_doc_tokens = [tokenize(d["content"]) for d in docs_corpus]
-
         current_hash = compute_corpus_hash(docs_corpus)
         cached = load_index()
         if cached and cached[2] == current_hash:
@@ -59,9 +54,9 @@ class Retriever:
             save_index(docs_embeddings, docs_corpus, current_hash)
 
         self._docs_corpus = docs_corpus
-        self._docs_doc_tokens = docs_doc_tokens
         self._docs_embeddings = docs_embeddings
 
+        self._bm25 = BM25Index()
         self._load_persisted_ingest()
 
     def _load_persisted_ingest(self):
@@ -74,18 +69,16 @@ class Retriever:
         if ingested:
             embeddings, chunks = ingested
             self._ingested_chunks = chunks
-            self._ingested_doc_tokens = [tokenize(c["content"]) for c in chunks]
             self._ingested_embeddings = embeddings
         else:
             self._ingested_chunks = []
-            self._ingested_doc_tokens = []
             self._ingested_embeddings = np.empty((0, self._docs_embeddings.shape[1]))
         self._rebuild_combined_corpus()
 
     def _rebuild_combined_corpus(self):
         self.corpus = self._docs_corpus + self._ingested_chunks
-        self._doc_tokens = self._docs_doc_tokens + self._ingested_doc_tokens
         self.corpus_embeddings = np.vstack([self._docs_embeddings, self._ingested_embeddings])
+        self._bm25.build(self.corpus)
 
     def _drop_ingested_sources(self, sources):
         """Remove any already-ingested chunks whose source is in `sources`.
@@ -100,13 +93,11 @@ class Retriever:
         if all(keep):
             return
         self._ingested_chunks = [c for c, k in zip(self._ingested_chunks, keep) if k]
-        self._ingested_doc_tokens = [t for t, k in zip(self._ingested_doc_tokens, keep) if k]
         self._ingested_embeddings = self._ingested_embeddings[keep]
 
     def search(self, query, top_k=None):
         top_k = top_k or self.top_k
         query_vec = self.embed_model.encode([query])[0]
-        query_tokens = tokenize(query)
 
         # Vectorized cosine similarity against the whole corpus at once.
         doc_norms = np.linalg.norm(self.corpus_embeddings, axis=1)
@@ -115,9 +106,13 @@ class Retriever:
         denom[denom == 0] = 1e-8  # avoid div-by-zero for empty/zero vectors
         vector_sims = (self.corpus_embeddings @ query_vec) / denom
 
+        # BM25 scores are unbounded, so normalize to [0, 1] before fusing
+        # with cosine similarity -- otherwise a strong keyword match could
+        # swamp vector_weight/keyword_weight's intended balance.
+        key_sims = normalize(self._bm25.scores(query))
+
         results = []
-        for doc, doc_tokens, vector_sim in zip(self.corpus, self._doc_tokens, vector_sims):
-            key_sim = score_tokens(query_tokens, doc_tokens)
+        for doc, vector_sim, key_sim in zip(self.corpus, vector_sims, key_sims):
             final_score = (
                 self.vector_weight * vector_sim +
                 self.keyword_weight * key_sim
@@ -158,7 +153,6 @@ class Retriever:
 
         new_embeddings = self.embed_model.encode([c["content"] for c in chunks])
         self._ingested_chunks.extend(chunks)
-        self._ingested_doc_tokens.extend(tokenize(c["content"]) for c in chunks)
         self._ingested_embeddings = np.vstack([self._ingested_embeddings, new_embeddings])
 
         save_ingested(self._ingested_embeddings, self._ingested_chunks)

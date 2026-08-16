@@ -20,7 +20,32 @@ def test_search_results_are_sorted_by_confidence():
     assert confidences == sorted(confidences, reverse=True)
 
 
-def test_add_chunks_keeps_doc_tokens_in_sync():
+def test_search_keyword_score_is_zero_when_bm25_has_no_match():
+    retriever = Retriever()
+    # No demo doc mentions this term, so BM25 has nothing to match and
+    # every keyword_score should come back 0.
+    results = retriever.search("teleportation")
+    assert all(r["metadata"]["keyword_score"] == 0.0 for r in results)
+
+
+def test_search_keyword_score_ranks_exact_term_match_highest():
+    retriever = Retriever()
+    retriever.add_chunks([{
+        "id": "kw-test-1",
+        "content": "Zorbnificator maintenance procedure and troubleshooting steps.",
+        "source": "kw-test",
+        "type": "web",
+        "order": 0,
+    }])
+    results = retriever.search("zorbnificator", top_k=1)
+    assert results[0]["source"] == "kw-test"
+    # This chunk is the only one in the corpus that could possibly match,
+    # so after min-max normalization across the corpus it should land
+    # exactly at 1.0.
+    assert results[0]["metadata"]["keyword_score"] == 1.0
+
+
+def test_add_chunks_keeps_embeddings_in_sync():
     retriever = Retriever()
     before = len(retriever.corpus)
 
@@ -34,9 +59,10 @@ def test_add_chunks_keeps_doc_tokens_in_sync():
     retriever.add_chunks([new_chunk])
 
     assert len(retriever.corpus) == before + 1
-    # _doc_tokens is a parallel cache to self.corpus; add_chunks() must keep
-    # both in lockstep or search() zips them against the wrong documents.
-    assert len(retriever._doc_tokens) == len(retriever.corpus)
+    # corpus_embeddings is a parallel array to self.corpus; add_chunks()
+    # must keep both in lockstep or search() zips them against the wrong
+    # documents.
+    assert retriever.corpus_embeddings.shape[0] == len(retriever.corpus)
 
     results = retriever.search("widget frobnication error 9001", top_k=1)
     assert results[0]["source"] == "test"
@@ -88,7 +114,6 @@ def test_re_ingesting_same_source_replaces_instead_of_duplicating():
         "order": 0,
     }])
     assert len(retriever.corpus) == before + 1
-    assert len(retriever._doc_tokens) == len(retriever.corpus)
     assert retriever.corpus_embeddings.shape[0] == len(retriever.corpus)
 
     results = retriever.search("frobnication support version 2.0", top_k=1)

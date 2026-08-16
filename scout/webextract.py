@@ -20,7 +20,13 @@ def extract_content(html: str, url: str = None) -> dict:
         html,
         url=url,
         output_format="markdown",
-        include_links=False,
+        # Tables and multi-line code blocks survive as markdown by
+        # default; links are kept too so citations in the source page
+        # (e.g. "see the related docs") carry their real URL into the
+        # evidence instead of being flattened to plain text. Images are
+        # left out: an image URL alone isn't useful evidence for a
+        # text-based agent, and there's no rendering surface for it here.
+        include_links=True,
         include_images=False,
         favor_precision=True,
     )

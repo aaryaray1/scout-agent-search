@@ -8,10 +8,10 @@ An agent that pulls information from the web gets raw HTML back and has to parse
 
 ## What's here
 
-- Local hybrid search (vector + keyword) over a markdown corpus: `scout/ingest.py`, `scout/embeddings.py`, `scout/index.py`, `scout/search.py`. Served as `POST /api/v1/search`.
-- HTML ingestion: fetch a URL or accept raw HTML, extract clean content with `trafilatura`, chunk it, index it. `scout/fetch.py`, `scout/webextract.py`, `scout/web.py`. Served as `POST /api/v1/ingest`.
+- Local hybrid search (vector + BM25 keyword) over a markdown corpus: `scout/ingest.py`, `scout/embeddings.py`, `scout/bm25.py`, `scout/index.py`, `scout/search.py`. Served as `POST /api/v1/search`.
+- HTML ingestion: fetch a URL or accept raw HTML, extract clean content with `trafilatura`, chunk it, index it. `scout/fetch.py`, `scout/webextract.py`, `scout/web.py`. Served as `POST /api/v1/ingest`. Ingested pages persist to disk and survive a restart, and re-ingesting the same URL replaces its content instead of duplicating it.
 
-Ingestion is a first pass, not a finished pipeline. See [ROADMAP.md](ROADMAP.md) for what's missing (durable storage for ingested pages, JS-rendered pages, richer structure).
+Ingestion is a first pass, not a finished pipeline. See [ROADMAP.md](ROADMAP.md) for what's missing (a real vector store past demo scale, JS-rendered pages, richer structure).
 
 ## Quickstart
 
@@ -34,6 +34,7 @@ curl -X POST http://127.0.0.1:8000/api/v1/search \
 
 ```json
 {
+  "schema_version": "1.0",
   "query": "rate limit exceeded",
   "results": [
     {
@@ -55,7 +56,7 @@ curl -X POST http://127.0.0.1:8000/api/v1/ingest \
   -d '{"url": "https://example.com/some/docs/page"}'
 ```
 
-Returns structured content directly and indexes it for immediate search. The index is in-memory only and won't survive a restart yet (see ROADMAP.md).
+Returns structured content directly and indexes it for immediate search. Ingested pages persist to disk (`data/index/`) and are reloaded on the next startup; re-ingesting the same URL replaces its content instead of duplicating it.
 
 ## Configuration
 
@@ -70,9 +71,9 @@ pytest
 ## Layout
 
 ```
-scout/          package: ingest, embed, index, search, fetch, webextract, web, api, cli
+scout/          package: ingest, embed, bm25, index, search, fetch, webextract, web, api, cli
 data/docs/      markdown source documents (demo corpus)
-data/index/     generated embedding cache, git-ignored
+data/index/     generated embedding cache + persisted ingested pages, git-ignored
 tests/          pytest suite
 ```
 
