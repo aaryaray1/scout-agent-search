@@ -1,5 +1,10 @@
+"""Sentence-embedding backend, with the loaded model shared per process."""
+import logging
 import threading
+
 from sentence_transformers import SentenceTransformer
+
+logger = logging.getLogger(__name__)
 
 _model_cache = {}
 _cache_lock = threading.Lock()
@@ -16,6 +21,7 @@ def _get_cached_model(model_name):
     if model_name not in _model_cache:
         with _cache_lock:
             if model_name not in _model_cache:  # re-check inside the lock
+                logger.info("loading embedding model '%s'", model_name)
                 _model_cache[model_name] = SentenceTransformer(model_name)
     return _model_cache[model_name]
 
@@ -23,6 +29,16 @@ def _get_cached_model(model_name):
 class EmbeddingModel:
     def __init__(self, model_name="all-MiniLM-L6-v2"):
         self.model = _get_cached_model(model_name)
+
+    @property
+    def dimension(self):
+        """Width of the vectors this model produces.
+
+        Needed to size an empty embedding matrix when there is nothing to
+        embed yet, which is the normal state for an ingest-only deployment
+        starting with no local markdown corpus.
+        """
+        return self.model.get_sentence_embedding_dimension()
 
     def encode(self, texts):
         return self.model.encode(texts, convert_to_numpy=True)

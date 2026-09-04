@@ -1,3 +1,5 @@
+import pytest
+
 from scout.search import Retriever
 
 def test_search():
@@ -150,3 +152,66 @@ def test_dedup_persists_correctly_across_restart():
     assert len(second.corpus) == before + 1
     results = second.search("frobnicator version 2.0 release notes", top_k=1)
     assert "2.0" in results[0]["content"]
+
+
+def test_retriever_starts_with_no_local_markdown_corpus(tmp_path):
+    """An ingest-only deployment has no docs_path corpus at all. Refusing to
+    start there (the previous behaviour) made Scout unhostable without
+    shipping a demo corpus alongside it."""
+    retriever = Retriever(docs_path=str(tmp_path))
+    assert retriever.corpus == []
+    assert retriever.search("anything at all") == []
+
+
+def test_ingest_only_retriever_can_still_serve_what_it_ingested(tmp_path):
+    retriever = Retriever(docs_path=str(tmp_path))
+    retriever.add_chunks([{
+        "id": "web-only-1",
+        "content": "Frobnicator calibration fails with error code 7331.",
+        "source": "https://example.com/only",
+        "type": "web",
+        "order": 0,
+    }])
+
+    results = retriever.search("frobnicator calibration 7331", top_k=1)
+    assert results[0]["source"] == "https://example.com/only"
+
+
+def test_add_chunks_ignores_an_empty_batch(tmp_path):
+    retriever = Retriever(docs_path=str(tmp_path))
+    retriever.add_chunks([])
+    assert retriever.corpus == []
+
+
+@pytest.mark.parametrize("bad_top_k", [0, -1])
+def test_search_rejects_a_non_positive_top_k(bad_top_k):
+    """`top_k or self.top_k` used to turn 0 into the default and let a
+    negative value slice from the end of the ranking."""
+    retriever = Retriever()
+    with pytest.raises(ValueError, match="top_k must be >= 1"):
+        retriever.search("rate limit", top_k=bad_top_k)
+
+
+def test_search_clamps_top_k_to_the_configured_ceiling():
+    retriever = Retriever()
+    results = retriever.search("rate limit", top_k=10_000)
+    assert len(results) <= retriever.max_top_k
+
+
+def test_search_returns_at_most_the_whole_corpus():
+    retriever = Retriever()
+    results = retriever.search("rate limit", top_k=retriever.max_top_k)
+    assert len(results) == min(retriever.max_top_k, len(retriever.corpus))
+
+
+def test_corpus_and_embeddings_stay_the_same_length_after_a_replacing_ingest():
+    retriever = Retriever()
+    for version in ["first version of the page", "second version of the page"]:
+        retriever.add_chunks([{
+            "id": f"len-{version}",
+            "content": version,
+            "source": "https://example.com/versioned",
+            "type": "web",
+            "order": 0,
+        }])
+        assert retriever.corpus_embeddings.shape[0] == len(retriever.corpus)

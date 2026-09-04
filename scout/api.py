@@ -1,9 +1,30 @@
+"""FastAPI surface: /api/v1/search and /api/v1/ingest.
+
+Both endpoints are deliberately `def`, not `async def`. Retrieval is
+CPU-bound (embedding a query, scoring the corpus) and ingest does a
+blocking outbound fetch; declaring them sync lets Starlette run them in
+its threadpool instead of stalling the event loop. Retriever is built for
+exactly that concurrency -- see its docstring on the two locks.
+"""
+import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Request
-from .search import Retriever
-from .models import SearchRequest, SearchResponse, IngestRequest, IngestResponse
+
+from fastapi import Depends, FastAPI, HTTPException, Request
+
+from .config import load_config
 from .fetch import FetchError
-from .web import ingest_url, ingest_html
+from .logsetup import configure_logging
+from .models import (
+    EVIDENCE_SCHEMA_VERSION,
+    IngestRequest,
+    IngestResponse,
+    SearchRequest,
+    SearchResponse,
+)
+from .search import Retriever
+from .web import ingest_html, ingest_url
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -17,11 +38,23 @@ async def lifespan(app: FastAPI):
     point at which test isolation (see tests/conftest.py) can redirect
     where it reads/writes.
     """
+    config = load_config()
+    configure_logging(config["log_level"])
     app.state.retriever = Retriever()
     yield
 
 
-app = FastAPI(title="Scout Agent Search", lifespan=lifespan)
+app = FastAPI(
+    title="Scout Agent Search",
+    version=EVIDENCE_SCHEMA_VERSION,
+    description="Search that returns pre-structured JSON evidence, so agents never parse HTML.",
+    lifespan=lifespan,
+)
+
+
+def get_retriever(request: Request) -> Retriever:
+    """Hand endpoints the shared Retriever built during startup."""
+    return request.app.state.retriever
 
 
 @app.get("/")
@@ -29,26 +62,46 @@ def root():
     return {
         "service": "Scout",
         "status": "running",
+        "schema_version": EVIDENCE_SCHEMA_VERSION,
         "docs": "/docs",
-        "redoc": "/redoc"
+        "redoc": "/redoc",
     }
 
 
 @app.get("/health")
-def health(request: Request):
-    return {"status": "ok", "corpus_size": len(request.app.state.retriever.corpus)}
+def health(retriever: Retriever = Depends(get_retriever)):
+    """Liveness plus enough state to tell an empty deployment from a
+    populated one."""
+    return {
+        "status": "ok",
+        "corpus_size": len(retriever.corpus),
+        "schema_version": EVIDENCE_SCHEMA_VERSION,
+    }
 
 
 @app.post("/api/v1/search", response_model=SearchResponse)
-def search_endpoint(q: SearchRequest, request: Request):
-    if not q.query or not q.query.strip():
-        raise HTTPException(status_code=422, detail="query must not be empty")
-    results = request.app.state.retriever.search(q.query, top_k=q.top_k)
+def search_endpoint(q: SearchRequest, retriever: Retriever = Depends(get_retriever)):
+    """Retrieve the best-matching evidence for a query.
+
+    Empty and oversized queries are rejected by SearchRequest itself, so
+    there is nothing left to validate here.
+    """
+    results = retriever.search(q.query, top_k=q.top_k)
     return {"query": q.query, "results": results}
 
 
+def _extract_page(req: IngestRequest):
+    """Run the right ingest path for the request and return
+    (source_url, title, metadata, chunks)."""
+    if req.url:
+        title, metadata, chunks = ingest_url(req.url)
+        return req.url, title, metadata, chunks
+    title, metadata, chunks = ingest_html(req.html, req.source_url)
+    return req.source_url, title, metadata, chunks
+
+
 @app.post("/api/v1/ingest", response_model=IngestResponse)
-def ingest_endpoint(req: IngestRequest, request: Request):
+def ingest_endpoint(req: IngestRequest, retriever: Retriever = Depends(get_retriever)):
     """Convert a web page (fetched by URL, or handed to us as raw HTML)
     straight into structured JSON: the conversion step agents otherwise
     have to do themselves. Also indexes the result so it's immediately
@@ -57,18 +110,18 @@ def ingest_endpoint(req: IngestRequest, request: Request):
     store).
     """
     try:
-        if req.url:
-            title, metadata, chunks = ingest_url(req.url)
-            source_url = req.url
-        else:
-            title, metadata, chunks = ingest_html(req.html, req.source_url)
-            source_url = req.source_url
+        source_url, title, metadata, chunks = _extract_page(req)
     except FetchError as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        # Upstream wouldn't give us the page: that's a bad gateway, not a
+        # bad request.
+        logger.warning("ingest fetch failed: %s", e)
+        raise HTTPException(status_code=502, detail=str(e)) from e
     except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
+        # Nothing extractable in the HTML: the caller's input is the problem.
+        logger.info("ingest extraction rejected: %s", e)
+        raise HTTPException(status_code=422, detail=str(e)) from e
 
-    request.app.state.retriever.add_chunks(chunks)
+    retriever.add_chunks(chunks)
 
     return {
         "url": source_url,

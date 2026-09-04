@@ -1,33 +1,59 @@
-from pathlib import Path
+"""Loading documents and splitting them into indexable chunks.
+
+Both the local markdown corpus and pages pulled off the web converge on
+the same doc shape here, so chunk_docs() is the single chunking path for
+everything Scout indexes.
+"""
+import logging
 import uuid
+from pathlib import Path
+
+from .config import load_config
+
+logger = logging.getLogger(__name__)
+
+# Fields chunk_docs() sets itself; everything else on a doc is an extra
+# that gets carried onto each chunk.
+_CORE_FIELDS = {"id", "content", "source", "type"}
+
+DEFAULT_TYPE = "documentation"
+
 
 def load_markdown_docs(path="data/docs"):
-
+    """Read every *.md file under `path` into a doc dict."""
     docs = []
-    for file in Path(path).glob("*.md"):
-        text = file.read_text(encoding="utf-8")
+    for file in sorted(Path(path).glob("*.md")):
         docs.append({
             "source": file.name,
-            "content": text,
-            # Default type
-            "type": "documentation"
+            "content": file.read_text(encoding="utf-8"),
+            "type": DEFAULT_TYPE,
         })
     return docs
 
 
-def chunk_text(text, chunk_size=400, overlap=50):
+def chunk_text(text, chunk_size=None, overlap=None):
+    """Split `text` into overlapping fixed-size word windows.
+
+    Chunking by word count ignores document structure and can split
+    mid-section; chunking by heading would preserve more meaning per chunk
+    (tracked in ROADMAP.md Phase 0).
+    """
+    config = load_config()
+    chunk_size = config["chunk_size"] if chunk_size is None else chunk_size
+    overlap = config["chunk_overlap"] if overlap is None else overlap
+    # The window advances by (chunk_size - overlap). A non-positive stride
+    # would re-emit the same words forever, so refuse it rather than hang.
+    stride = chunk_size - overlap
+    if stride < 1:
+        raise ValueError(
+            f"overlap ({overlap}) must be smaller than chunk_size ({chunk_size})"
+        )
 
     words = text.split()
-    chunks = []
-    start = 0
-
-    while start < len(words):
-        end = start + chunk_size
-        chunk = " ".join(words[start:end])
-        chunks.append(chunk)
-        start = end - overlap
-
-    return chunks
+    return [
+        " ".join(words[start:start + chunk_size])
+        for start in range(0, len(words), stride)
+    ]
 
 
 def doc_from_web_content(extracted, source_url):
@@ -46,34 +72,33 @@ def doc_from_web_content(extracted, source_url):
     }
 
 
-_CORE_FIELDS = {"id", "content", "source", "type"}
+def _chunks_for_doc(doc):
+    """Split one doc into chunk dicts, carrying its extra fields along.
+
+    Never writes back to `doc`: callers hand in their own dicts (the CLI
+    reuses them for logging, tests assert on them), and a chunker that
+    quietly stamps an id onto its input is a trap for the next caller.
+    """
+    doc_id = doc.get("id") or str(uuid.uuid4())
+    doc_type = doc.get("type", DEFAULT_TYPE)
+    extra_fields = {k: v for k, v in doc.items() if k not in _CORE_FIELDS}
+
+    return [
+        {
+            "id": doc_id,
+            "content": chunk,
+            "source": doc["source"],
+            "type": doc_type,
+            "order": order,
+            **extra_fields,
+        }
+        for order, chunk in enumerate(chunk_text(doc["content"]))
+    ]
 
 
 def chunk_docs(docs):
-
+    """Flatten a list of docs into a flat list of indexable chunks."""
     chunks = []
-
     for doc in docs:
-        # Generate unique ID
-        if "id" not in doc:
-            doc["id"] = str(uuid.uuid4())
-
-        # Ensure 'type' exists
-        doc_type = doc.get("type", "documentation")
-
-        # Carry through any doc-level extras (title, url, page_metadata, ...)
-        # onto every chunk so callers (e.g. the ingest API) don't lose them.
-        extra_fields = {k: v for k, v in doc.items() if k not in _CORE_FIELDS}
-
-        # Chunk content
-        for order, chunk in enumerate(chunk_text(doc["content"])):
-            chunks.append({
-                "id": doc["id"],
-                "content": chunk,
-                "source": doc["source"],
-                "type": doc_type,
-                "order": order,
-                **extra_fields,
-            })
-
+        chunks.extend(_chunks_for_doc(doc))
     return chunks

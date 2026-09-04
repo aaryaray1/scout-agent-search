@@ -64,27 +64,37 @@ class BM25Index:
         # classic Robertson-Sparck Jones formula can.
         return math.log(1 + (self._n_docs - n_t + 0.5) / (n_t + 0.5))
 
+    def _length_norm(self, length):
+        """BM25's document-length penalty, which depends only on the
+        document -- not on the query term -- so it's computed once per
+        document rather than once per term."""
+        return K1 * (1 - B + B * length / self._avg_doc_length)
+
+    def _score_doc(self, counts, length, idfs):
+        """Sum the BM25 contribution of every query term present in one
+        document. `idfs` is pre-computed per query, not per document."""
+        length_norm = self._length_norm(length)
+        score = 0.0
+        for term, idf in idfs.items():
+            f = counts.get(term, 0)
+            if f:
+                score += idf * (f * (K1 + 1)) / (f + length_norm)
+        return score
+
     def scores(self, query):
         """Return one BM25 score per corpus position, in build()'s order.
         0.0 for documents sharing no term with the query."""
         if not self._n_docs:
             return []
         query_terms = set(term_counts(query).keys())
-        scores = [0.0] * self._n_docs
         if not query_terms or self._avg_doc_length == 0:
-            return scores
+            return [0.0] * self._n_docs
 
-        idfs = {t: self._idf(t) for t in query_terms}
-        for i, (counts, length) in enumerate(zip(self._doc_term_counts, self._doc_lengths)):
-            score = 0.0
-            for term in query_terms:
-                f = counts.get(term, 0)
-                if f == 0:
-                    continue
-                denom = f + K1 * (1 - B + B * length / self._avg_doc_length)
-                score += idfs[term] * (f * (K1 + 1)) / denom
-            scores[i] = score
-        return scores
+        idfs = {term: self._idf(term) for term in query_terms}
+        return [
+            self._score_doc(counts, length, idfs)
+            for counts, length in zip(self._doc_term_counts, self._doc_lengths)
+        ]
 
 
 def normalize(scores):
