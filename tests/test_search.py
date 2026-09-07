@@ -215,3 +215,43 @@ def test_corpus_and_embeddings_stay_the_same_length_after_a_replacing_ingest():
             "order": 0,
         }])
         assert retriever.corpus_embeddings.shape[0] == len(retriever.corpus)
+
+
+def test_search_many_answers_each_query_independently():
+    retriever = Retriever()
+    batched = retriever.search_many(["Error 1008", "rate limit exceeded"], top_k=2)
+    assert len(batched) == 2
+    assert all(len(results) == 2 for results in batched)
+    assert batched[0] == retriever.search("Error 1008", top_k=2)
+    assert batched[1] == retriever.search("rate limit exceeded", top_k=2)
+
+
+def test_search_many_embeds_every_query_in_one_call():
+    """Batching exists so a sentence-transformer sees the whole batch at
+    once. A loop over search() would encode once per query, which is the
+    cost this method is meant to avoid."""
+    retriever = Retriever()
+    calls = []
+    original = retriever.embed_model.encode
+
+    def counting_encode(texts):
+        calls.append(list(texts))
+        return original(texts)
+
+    retriever.embed_model = type(
+        "Counting", (), {"encode": staticmethod(counting_encode)}
+    )()
+    retriever.search_many(["one", "two", "three"])
+
+    assert calls == [["one", "two", "three"]]
+
+
+def test_search_many_on_an_empty_batch_returns_nothing():
+    retriever = Retriever()
+    assert retriever.search_many([]) == []
+
+
+def test_search_many_validates_top_k_once_for_the_batch():
+    retriever = Retriever()
+    with pytest.raises(ValueError):
+        retriever.search_many(["a", "b"], top_k=0)

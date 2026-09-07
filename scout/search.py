@@ -186,10 +186,13 @@ class Retriever:
             raise ValueError(f"top_k must be >= 1, got {top_k}")
         return min(top_k, self.max_top_k)
 
-    def _fused_scores(self, query, embeddings, bm25):
+    def _fused_scores(self, query, query_vec, embeddings, bm25):
         """Blend cosine similarity with normalized BM25 into one score per
-        corpus position. Returns (fused, vector_sims, keyword_sims)."""
-        query_vec = self.embed_model.encode([query])[0]
+        corpus position. Returns (fused, vector_sims, keyword_sims).
+
+        Takes the query's embedding rather than computing it, so a batch
+        can embed all its queries in one call to the model.
+        """
         vector_sims = _cosine_similarity(embeddings, query_vec)
         # BM25 scores are unbounded, so normalize to [0, 1] before fusing
         # with cosine similarity -- otherwise a strong keyword match could
@@ -198,14 +201,11 @@ class Retriever:
         fused = self.vector_weight * vector_sims + self.keyword_weight * keyword_sims
         return fused, vector_sims, keyword_sims
 
-    def search(self, query, top_k=None):
-        """Return the top_k best-matching chunks as evidence dicts."""
-        top_k = self._resolve_top_k(top_k)
-        corpus, embeddings, bm25 = self._snapshot()
-        if not corpus:
-            return []
-
-        fused, vector_sims, keyword_sims = self._fused_scores(query, embeddings, bm25)
+    def _rank(self, query, query_vec, corpus, embeddings, bm25, top_k):
+        """Score one query against a snapshot and shape the winners."""
+        fused, vector_sims, keyword_sims = self._fused_scores(
+            query, query_vec, embeddings, bm25
+        )
         # Rank on the score array, then build result dicts only for the
         # chunks actually being returned. The previous version built a dict
         # for every chunk in the corpus on every query and threw away all
@@ -214,6 +214,34 @@ class Retriever:
         return [
             _as_evidence(corpus[i], fused[i], vector_sims[i], keyword_sims[i])
             for i in ranked
+        ]
+
+    def search(self, query, top_k=None):
+        """Return the top_k best-matching chunks as evidence dicts."""
+        return self.search_many([query], top_k=top_k)[0]
+
+    def search_many(self, queries, top_k=None):
+        """Answer several queries at once, returning one result list each,
+        in the order asked.
+
+        Worth having as its own method rather than a loop over search():
+        it takes one corpus snapshot for the whole batch, so every query in
+        it is answered against the same index even if an ingest lands
+        mid-batch, and it embeds all the queries in a single call to the
+        model, which is where a sentence-transformer's batching actually
+        pays off.
+        """
+        top_k = self._resolve_top_k(top_k)
+        if not queries:
+            return []
+        corpus, embeddings, bm25 = self._snapshot()
+        if not corpus:
+            return [[] for _ in queries]
+
+        query_vecs = self.embed_model.encode(list(queries))
+        return [
+            self._rank(query, vec, corpus, embeddings, bm25, top_k)
+            for query, vec in zip(queries, query_vecs)
         ]
 
     # -- ingestion -----------------------------------------------------------

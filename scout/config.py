@@ -33,8 +33,34 @@ _DEFAULTS = {
     "max_top_k": 50,
     "max_query_chars": 2000,
     "max_html_bytes": 5 * 1024 * 1024,
+    # Batch ceilings. A batch request costs Scout roughly its length, so
+    # these bound fan-out the same way max_top_k bounds a single search.
+    "max_batch_queries": 10,
+    "max_batch_ingest": 5,
+    # Auth. Empty means no authentication at all, which is the right
+    # default for `uvicorn scout.api:app` on a laptop and the wrong one
+    # for anything reachable. Startup says so out loud either way.
+    "api_keys": [],
+    # Per-caller rate limit on ingest, which is the endpoint that spends
+    # Scout's network on the caller's behalf. 0 disables it.
+    "ingest_rate_limit": 30,
+    "ingest_rate_window": 60,
     "log_level": "INFO",
 }
+
+
+def _parse_key_list(raw):
+    """Read a comma-separated env value into a list of non-empty items.
+
+    Secrets arrive through the environment far more often than through a
+    committed config.json, so SCOUT_API_KEYS has to be expressible as one
+    string. An empty or whitespace-only value yields [], which is a
+    deliberate "no auth", not a parse failure.
+    """
+    if isinstance(raw, list):
+        return [str(k).strip() for k in raw if str(k).strip()]
+    return [k.strip() for k in str(raw).split(",") if k.strip()]
+
 
 # Environment variables arrive as strings; every non-string setting needs to
 # say how to read itself back.
@@ -47,6 +73,11 @@ _PARSERS = {
     "max_top_k": int,
     "max_query_chars": int,
     "max_html_bytes": int,
+    "max_batch_queries": int,
+    "max_batch_ingest": int,
+    "api_keys": _parse_key_list,
+    "ingest_rate_limit": int,
+    "ingest_rate_window": int,
 }
 
 
@@ -81,14 +112,11 @@ def _from_env(keys):
     return overrides
 
 
-def _validate(config):
-    """Reject settings that would break the pipeline rather than letting
-    them fail somewhere less obvious.
-
-    chunk_overlap is the one that genuinely matters: chunk_text() advances
-    by (chunk_size - chunk_overlap), so an overlap at or above chunk_size
-    never advances and loops forever, filling memory. Catching it here
-    turns a hang into a startup error naming the offending setting.
+def _validate_chunking(config):
+    """chunk_overlap is the setting that genuinely matters: chunk_text()
+    advances by (chunk_size - chunk_overlap), so an overlap at or above
+    chunk_size never advances and loops forever, filling memory. Catching
+    it here turns a hang into a startup error naming the setting.
     """
     if config["chunk_size"] < 1:
         raise ValueError(f"chunk_size must be >= 1, got {config['chunk_size']}")
@@ -97,8 +125,32 @@ def _validate(config):
             f"chunk_overlap must be >= 0 and < chunk_size "
             f"({config['chunk_size']}), got {config['chunk_overlap']}"
         )
+
+
+def _validate_limits(config):
+    """Bounds that would otherwise fail as a confusing 422, an always-empty
+    result, or (for the rate window) a division by zero at request time."""
     if config["top_k"] < 1:
         raise ValueError(f"top_k must be >= 1, got {config['top_k']}")
+    for key in ("max_batch_queries", "max_batch_ingest"):
+        if config[key] < 1:
+            raise ValueError(f"{key} must be >= 1, got {config[key]}")
+    if config["ingest_rate_limit"] < 0:
+        raise ValueError(
+            f"ingest_rate_limit must be >= 0 (0 disables it), "
+            f"got {config['ingest_rate_limit']}"
+        )
+    if config["ingest_rate_window"] < 1:
+        raise ValueError(
+            f"ingest_rate_window must be >= 1 second, got {config['ingest_rate_window']}"
+        )
+
+
+def _validate(config):
+    """Reject settings that would break the pipeline rather than letting
+    them fail somewhere less obvious."""
+    _validate_chunking(config)
+    _validate_limits(config)
     return config
 
 
@@ -116,9 +168,13 @@ def load_config():
     Resolved once per process and handed out as a copy, so callers on a hot
     path (chunking every document, say) don't re-read config.json each
     time, and a caller mutating what it gets back can't corrupt anyone
-    else's view of it.
+    else's view of it. List settings (api_keys) are copied too, so that
+    promise holds a level deeper than a plain dict() copy would make it.
     """
-    return dict(_resolved_config())
+    return {
+        key: list(value) if isinstance(value, list) else value
+        for key, value in _resolved_config().items()
+    }
 
 
 def reset_config_cache():

@@ -9,7 +9,7 @@ caller can discover the limits instead of discovering them by getting a
 The caps also bound what a single request can cost Scout. They are not a
 substitute for auth and rate limiting, which remain ROADMAP.md Phase 3.
 """
-from typing import Annotated, Dict, List, Optional
+from typing import Annotated, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, StringConstraints, model_validator
 
@@ -24,6 +24,8 @@ _config = load_config()
 MAX_TOP_K = _config["max_top_k"]
 MAX_QUERY_CHARS = _config["max_query_chars"]
 MAX_HTML_CHARS = _config["max_html_bytes"]
+MAX_BATCH_QUERIES = _config["max_batch_queries"]
+MAX_BATCH_INGEST = _config["max_batch_ingest"]
 MAX_URL_CHARS = 2048
 
 # Whitespace-only queries collapse to "" and fail min_length, so an empty
@@ -96,3 +98,57 @@ class IngestResponse(BaseModel):
     type: str = "web"
     metadata: Dict
     chunks: List[IngestChunk]
+
+
+class BatchSearchRequest(BaseModel):
+    """Several queries answered against one consistent view of the corpus.
+
+    Batch length is capped for the same reason top_k is: it multiplies
+    what one request costs.
+    """
+    queries: List[QueryStr] = Field(
+        min_length=1,
+        max_length=MAX_BATCH_QUERIES,
+        description="Queries to answer. Results come back in this order.",
+    )
+    agent_id: str = Field(default="default", max_length=128)
+    top_k: Optional[int] = Field(default=None, ge=1, le=MAX_TOP_K)
+
+
+class BatchSearchResult(BaseModel):
+    query: str
+    results: List[Evidence]
+
+
+class BatchSearchResponse(BaseModel):
+    schema_version: str = EVIDENCE_SCHEMA_VERSION
+    results: List[BatchSearchResult]
+
+
+class BatchIngestRequest(BaseModel):
+    items: List[IngestRequest] = Field(
+        min_length=1,
+        max_length=MAX_BATCH_INGEST,
+        description="Pages to ingest. Each item takes the same shape as /ingest.",
+    )
+
+
+class BatchIngestResult(BaseModel):
+    """One item's outcome. A batch never fails as a whole for one bad page.
+
+    `status` carries the failure category that the single-page endpoint
+    expresses as an HTTP status (502 vs 422), because per-item outcomes
+    have nowhere else to put it: "fetch_error" means Scout couldn't get
+    the page, "extract_error" means it got one with nothing in it.
+    """
+    status: Literal["ok", "fetch_error", "extract_error"] = Field(
+        description="Whether the page was ingested, unreachable, or empty."
+    )
+    url: str
+    page: Optional[IngestResponse] = None
+    error: Optional[str] = None
+
+
+class BatchIngestResponse(BaseModel):
+    schema_version: str = EVIDENCE_SCHEMA_VERSION
+    results: List[BatchIngestResult]

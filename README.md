@@ -10,8 +10,11 @@ An agent that pulls information from the web gets raw HTML back and has to parse
 
 - Local hybrid search (vector + BM25 keyword) over a markdown corpus: `scout/ingest.py`, `scout/embeddings.py`, `scout/bm25.py`, `scout/index.py`, `scout/search.py`. Served as `POST /api/v1/search`.
 - HTML ingestion: fetch a URL or accept raw HTML, extract clean content with `trafilatura`, chunk it, index it. `scout/fetch.py`, `scout/webextract.py`, `scout/web.py`. Served as `POST /api/v1/ingest`. Ingested pages persist to disk and survive a restart, and re-ingesting the same URL replaces its content instead of duplicating it.
+- Batch endpoints for agents that fan out: `POST /api/v1/search/batch` and `POST /api/v1/ingest/batch`. A batch of queries is answered against one corpus snapshot; a batch of pages is indexed in one write, and a page that fails fails alone.
+- API-key auth (`scout/auth.py`) and per-caller ingest rate limiting (`scout/ratelimit.py`) on the `/api/v1` surface.
+- A Python client so agent frameworks don't hand-roll HTTP: `scout/client.py`.
 
-Ingestion is a first pass, not a finished pipeline. See [ROADMAP.md](ROADMAP.md) for what's missing (a real vector store past demo scale, JS-rendered pages, auth).
+Ingestion is a first pass, not a finished pipeline. See [ROADMAP.md](ROADMAP.md) for what's missing (a real vector store past demo scale, JS-rendered pages, a rate limit shared across workers).
 
 ## Quickstart
 
@@ -58,6 +61,43 @@ curl -X POST http://127.0.0.1:8000/api/v1/ingest \
 
 Returns structured content directly and indexes it for immediate search. Ingested pages persist to disk (`data/index/`) and are reloaded on the next startup; re-ingesting the same URL replaces its content instead of duplicating it.
 
+## Fan-out
+
+An agent working through a page of links, or decomposing a question into sub-questions, shouldn't pay a round trip per item.
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/v1/ingest/batch \
+  -H "Content-Type: application/json" \
+  -d '{"items": [{"url": "https://example.com/a"}, {"url": "https://example.com/b"}]}'
+```
+
+```json
+{
+  "schema_version": "1.0",
+  "results": [
+    { "status": "ok", "url": "https://example.com/a", "page": { "title": "A", "chunks": [] } },
+    { "status": "fetch_error", "url": "https://example.com/b", "error": "..." }
+  ]
+}
+```
+
+One bad page fails alone: results come back in request order, each with its own `status` (`ok`, `fetch_error`, `extract_error`), so eight of ten links working returns eight pages rather than one error. Everything that succeeded is indexed in a single write rather than one per page.
+
+`POST /api/v1/search/batch` takes `{"queries": [...]}` and answers every query against the same corpus snapshot, embedding the whole batch in one pass through the model.
+
+## Python client
+
+```python
+from scout.client import ScoutClient
+
+with ScoutClient("http://localhost:8000", api_key="...") as scout:
+    page = scout.ingest_url("https://example.com/docs/errors")
+    hits = scout.search("what does error 429 mean", top_k=3)
+    pages = scout.ingest_batch([{"url": u} for u in urls])
+```
+
+Responses come back as plain dicts, not the server's Pydantic models: a client that parsed into them would reject a response from a server one schema version ahead, which is exactly what `schema_version` exists to let callers manage. A mismatched major version logs a warning. Errors raise `ScoutAPIError`, which keeps `status_code`, `detail` and (for a 429) `retry_after` separate so a caller can branch on them.
+
 ## Configuration
 
 Settings resolve in three layers, each overriding the one before it:
@@ -79,6 +119,11 @@ The environment layer wins so a deployment can be reconfigured without editing f
 | `max_top_k` | `SCOUT_MAX_TOP_K` | `50` | ceiling on `top_k` a caller may request |
 | `max_query_chars` | `SCOUT_MAX_QUERY_CHARS` | `2000` | ceiling on query length |
 | `max_html_bytes` | `SCOUT_MAX_HTML_BYTES` | `5242880` | ceiling on an inline `html` payload |
+| `max_batch_queries` | `SCOUT_MAX_BATCH_QUERIES` | `10` | ceiling on queries in one `/search/batch` |
+| `max_batch_ingest` | `SCOUT_MAX_BATCH_INGEST` | `5` | ceiling on pages in one `/ingest/batch` |
+| `api_keys` | `SCOUT_API_KEYS` | (empty) | comma-separated API keys; empty means no auth |
+| `ingest_rate_limit` | `SCOUT_INGEST_RATE_LIMIT` | `30` | ingests allowed per caller per window; `0` disables |
+| `ingest_rate_window` | `SCOUT_INGEST_RATE_WINDOW` | `60` | the rate-limit window, in seconds |
 | `log_level` | `SCOUT_LOG_LEVEL` | `INFO` | level for Scout's own loggers (dependencies stay at WARNING) |
 
 Settings that would break the pipeline are rejected at load rather than failing somewhere less obvious. A `chunk_overlap` at or above `chunk_size`, for instance, leaves the chunker with a stride of zero and would loop forever, so it raises at startup naming the offending setting.
@@ -96,7 +141,17 @@ SCOUT_DOCS_PATH=/var/empty SCOUT_INDEX_DIR=/data/scout \
 
 **Concurrency.** The endpoints are sync, so Starlette runs them in its threadpool and a search can land mid-ingest. `Retriever` swaps its corpus, embeddings and BM25 index as a single unit under a lock held only for the handover; embedding and disk writes happen outside it. See `tests/test_concurrency.py`.
 
-**Limits.** Request-shape caps are declared on the Pydantic models, so they appear in `/openapi.json` and an agent can discover them instead of finding them via a 422. Outbound fetches are capped by streaming the response and stopping at the byte limit, rather than trusting `Content-Length`. Auth and rate limiting are **not** implemented, see ROADMAP Phase 3 before exposing this beyond a trusted network.
+**Auth.** Set `SCOUT_API_KEYS` to one or more comma-separated keys and every `/api/v1` route requires an `X-API-Key` header matching one of them. Keys are compared in constant time and never logged: callers are identified downstream by a short hash of the key they presented.
+
+```bash
+SCOUT_API_KEYS="$(openssl rand -hex 24)" uvicorn scout.api:app --host 0.0.0.0
+```
+
+With no keys set there is no auth at all, which is right for a laptop and wrong for anything reachable, so startup logs which of the two it is and `/health` reports `"auth": "enabled" | "disabled"`, since "did my keys reach the container" shouldn't only be answerable by getting rejected. `/` and `/health` stay open so a liveness probe doesn't need a credential.
+
+**Rate limiting.** `/api/v1/ingest` and `/api/v1/ingest/batch` are limited per caller (per key, or per client IP when auth is off), since ingest is the endpoint that spends Scout's network on hosts the caller chooses. A batch costs one unit per item, so it can't be used to make N outbound fetches for the price of one. Exceeding it returns 429 with a `Retry-After` header. The bucket is in-process, so N uvicorn workers means N times the configured limit; a shared store is ROADMAP Phase 2 work.
+
+**Limits.** Request-shape caps are declared on the Pydantic models, so they appear in `/openapi.json` (including the batch ceilings and the API-key security scheme) and an agent can discover them instead of finding them via a 422. Outbound fetches are capped by streaming the response and stopping at the byte limit, rather than trusting `Content-Length`.
 
 ## Tests
 
@@ -104,7 +159,9 @@ SCOUT_DOCS_PATH=/var/empty SCOUT_INDEX_DIR=/data/scout \
 pytest
 ```
 
-106 tests, no network access required. The suite covers the SSRF/redirect/size guards against a mock transport, storage corruption and atomicity, config layering, concurrent search-during-ingest, and the HTTP layer end to end.
+165 tests, no network access required. The suite covers the SSRF/redirect/size guards against a mock transport, storage corruption and atomicity, config layering, concurrent search-during-ingest, auth and rate limiting, batch fan-out, the Python client against the real ASGI app, and the HTTP layer end to end.
+
+Tests for the guards are written against a deliberately broken version first: an auth check that always matches, a limiter that never evicts, a batch charged as one request. A test that still passes against the bug it describes is worse than no test.
 
 Complexity is tracked with `radon`:
 
@@ -117,7 +174,8 @@ Nothing in `scout/` currently exceeds CC 6, against a refactor-now threshold of 
 ## Layout
 
 ```
-scout/          package: ingest, embed, bm25, index, search, fetch, webextract, web, api, cli, config, logsetup
+scout/          package: ingest, embed, bm25, index, search, fetch, webextract, web,
+                api, auth, ratelimit, client, cli, config, logsetup
 data/docs/      markdown source documents (demo corpus)
 data/index/     generated embedding cache + persisted ingested pages, git-ignored
 tests/          pytest suite
