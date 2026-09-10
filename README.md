@@ -14,7 +14,9 @@ An agent that pulls information from the web gets raw HTML back and has to parse
 - API-key auth (`scout/auth.py`) and per-caller ingest rate limiting (`scout/ratelimit.py`) on the `/api/v1` surface.
 - A Python client so agent frameworks don't hand-roll HTTP: `scout/client.py`.
 
-Ingestion is a first pass, not a finished pipeline. See [ROADMAP.md](ROADMAP.md) for what's missing (a real vector store past demo scale, JS-rendered pages, a rate limit shared across workers).
+The keyword index is incremental: an ingest updates only the pages that changed rather than rebuilding, so its cost is flat in the size of the corpus instead of linear. [docs/architecture/adr-001-incremental-index.md](docs/architecture/adr-001-incremental-index.md) has the measurements, and why a vector database is deferred rather than adopted.
+
+Ingestion is a first pass, not a finished pipeline. See [ROADMAP.md](ROADMAP.md) for what's missing (a store that appends instead of rewriting, JS-rendered pages, a rate limit shared across workers).
 
 ## Quickstart
 
@@ -139,7 +141,7 @@ SCOUT_DOCS_PATH=/var/empty SCOUT_INDEX_DIR=/data/scout \
 
 **State.** Everything durable lives under `index_dir`: the docs-corpus embedding cache (rebuildable) and the ingested-page store (not). Mount it on a volume. The two are treated differently on corruption: a damaged docs cache degrades to a cache miss and re-embeds, while a damaged ingested store raises rather than starting up empty and letting the next ingest overwrite recoverable data. Every write goes through a temp file and an atomic rename, so a crash mid-write leaves the previous good file in place.
 
-**Concurrency.** The endpoints are sync, so Starlette runs them in its threadpool and a search can land mid-ingest. `Retriever` swaps its corpus, embeddings and BM25 index as a single unit under a lock held only for the handover; embedding and disk writes happen outside it. See `tests/test_concurrency.py`.
+**Concurrency.** The endpoints are sync, so Starlette runs them in its threadpool and a search can land mid-ingest. `Retriever` guards the searchable view - corpus, embeddings, slot mapping and keyword index - with one lock, held on both the read and the write side, because the keyword index is updated in place rather than rebuilt and swapped. That is affordable because an update costs the page being ingested rather than the whole corpus, and because keyword scoring is pure Python and already serialized by the GIL. Query embedding, the similarity scan and disk writes all happen outside the lock. See `tests/test_concurrency.py`.
 
 **Auth.** Set `SCOUT_API_KEYS` to one or more comma-separated keys and every `/api/v1` route requires an `X-API-Key` header matching one of them. Keys are compared in constant time and never logged: callers are identified downstream by a short hash of the key they presented.
 
@@ -159,9 +161,9 @@ With no keys set there is no auth at all, which is right for a laptop and wrong 
 pytest
 ```
 
-165 tests, no network access required. The suite covers the SSRF/redirect/size guards against a mock transport, storage corruption and atomicity, config layering, concurrent search-during-ingest, auth and rate limiting, batch fan-out, the Python client against the real ASGI app, and the HTTP layer end to end.
+197 tests, no network access required. The suite covers the SSRF/redirect/size guards against a mock transport, storage corruption and atomicity, config layering, concurrent search-during-ingest, incremental keyword-index updates and their slot mapping, the storage interface, auth and rate limiting, batch fan-out, the Python client against the real ASGI app, and the HTTP layer end to end.
 
-Tests for the guards are written against a deliberately broken version first: an auth check that always matches, a limiter that never evicts, a batch charged as one request. A test that still passes against the bug it describes is worse than no test.
+Tests for the guards are written against a deliberately broken version first: an auth check that always matches, a limiter that never evicts, a batch charged as one request, a keyword index that renumbers slots instead of tombstoning them. A test that still passes against the bug it describes is worse than no test.
 
 Complexity is tracked with `radon`:
 
@@ -171,13 +173,24 @@ radon cc -s -n B scout/     # anything scoring worse than A
 
 Nothing in `scout/` currently exceeds CC 6, against a refactor-now threshold of 11.
 
+Index performance is tracked with a benchmark rather than an assertion:
+
+```bash
+python scripts/bench_index.py
+```
+
+It reports what an ingest and a query cost at increasing corpus sizes. The numbers quoted in [ROADMAP.md](ROADMAP.md) and the ADRs come from it, so they can be re-checked instead of believed.
+
 ## Layout
 
 ```
 scout/          package: ingest, embed, bm25, index, search, fetch, webextract, web,
                 api, auth, ratelimit, client, cli, config, logsetup
+scout/store/    storage backends for ingested pages, behind one interface
 data/docs/      markdown source documents (demo corpus)
 data/index/     generated embedding cache + persisted ingested pages, git-ignored
+docs/           architecture decision records
+scripts/        benchmarks
 tests/          pytest suite
 ```
 

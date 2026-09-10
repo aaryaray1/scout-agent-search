@@ -12,3 +12,6 @@ data/index/
 build/
 dist/
 .pytest_cache/
+
+# assistant working memory, not part of the project
+PROJECT_STATE.md

@@ -4,13 +4,32 @@ import threading
 
 import numpy as np
 
-from .bm25 import BM25Index, normalize
+from .bm25 import BM25Index, normalize_array
 from .config import load_config
 from .embeddings import EmbeddingModel
 from .index import compute_corpus_hash, load_index, load_ingested, save_index, save_ingested
 from .ingest import chunk_docs, load_markdown_docs
 
 logger = logging.getLogger(__name__)
+
+# Tombstoned BM25 slots cost memory and make every scores() call allocate a
+# longer list than it needs, but compaction invalidates every slot number
+# the retriever holds, so it isn't free either. Compact only once the dead
+# weight is worth the renumbering: a meaningful share of the index, and more
+# than a handful of documents, so a tiny corpus doesn't compact on every
+# re-ingest.
+_COMPACT_TOMBSTONE_RATIO = 0.3
+_COMPACT_MIN_TOMBSTONES = 32
+
+
+def _where(items, mask, wanted=True):
+    """Filter `items` by a parallel boolean `mask`.
+
+    The three ingested-layer lists (chunks, slots, embeddings) have to be
+    filtered by the same mask or they stop describing the same documents, so
+    the filtering is written once rather than three times.
+    """
+    return [item for item, flag in zip(items, mask) if flag == wanted]
 
 
 def _cosine_similarity(matrix, vector):
@@ -46,26 +65,53 @@ class Retriever:
     - the ingested corpus (self._ingested_*): pages added later through
       add_chunks()/`/api/v1/ingest`, persisted so they survive a restart.
 
-    self.corpus / self.corpus_embeddings / self._bm25 are derived from
-    both layers, replaced as a group by _rebuild_combined_corpus()
-    whenever either layer changes. Keeping them as two separate layers
-    (rather than one flat list) is what makes de-duplication on re-ingest
-    tractable: dropping a stale source only ever touches the ingested
-    layer, never the docs_path corpus.
+    self.corpus / self.corpus_embeddings / self._bm25_slots are derived
+    from both layers and replaced as a group whenever either layer
+    changes. Keeping them as two separate layers (rather than one flat
+    list) is what makes de-duplication on re-ingest tractable: dropping a
+    stale source only ever touches the ingested layer, never the docs_path
+    corpus.
+
+    **Slots.** self._bm25 addresses documents by slot, not by corpus
+    position, because removing a document leaves a tombstone behind rather
+    than shifting everything after it (see scout/bm25.py). self._bm25_slots
+    is the mapping: for corpus position i, self._bm25_slots[i] is where
+    that chunk lives in the keyword index. Scoring indexes one through the
+    other, which is a numpy gather rather than a Python loop.
 
     Concurrency: FastAPI runs the sync endpoints in a threadpool, so a
-    search can land mid-ingest. Two locks keep that safe without making
-    readers wait on slow work:
+    search can land mid-ingest. Two locks keep that safe:
 
     - _ingest_lock serializes add_chunks() against itself, covering the
       ingested layer and its on-disk store.
-    - _swap_lock covers only the three-attribute handover in
-      _rebuild_combined_corpus() and the matching read in _snapshot(), so
-      a search can never observe a new corpus against stale embeddings or
-      a stale BM25 index.
+    - _index_lock covers the searchable view: the corpus, the embeddings,
+      the slot mapping and the BM25 index itself, on both the read and the
+      write side.
 
-    Embedding and disk writes happen outside _swap_lock, so an ingest
-    never blocks a concurrent search for longer than the swap itself.
+    _index_lock covering reads is a change from the original design, which
+    kept readers lock-free by rebuilding a whole new BM25 index on every
+    ingest and swapping it in. That rebuild re-tokenized the entire corpus
+    and cost 3.4 seconds per ingest at 20k chunks, which is what
+    docs/architecture/adr-001-incremental-index.md replaced with an index
+    mutated in place. An index mutated in place cannot be read
+    concurrently -- a search iterating a posting list while an ingest
+    inserts into it raises RuntimeError -- so readers take the lock.
+
+    That is affordable for the same reason the change was worth making:
+    mutation is now proportional to what changed rather than to the corpus,
+    and BM25 scoring is pure Python, which the GIL already serializes
+    across threads. The work that genuinely parallelizes -- embedding a
+    query, the numpy similarity scan, disk writes -- all happens outside
+    the lock.
+
+    The exception worth knowing about is /api/v1/search/batch, which scores
+    up to max_batch_queries queries in one locked section rather than one.
+    The GIL argument still applies to each query, but the hold time
+    multiplies, and that endpoint is not rate limited, so a few concurrent
+    batch callers can hold up an ingest for noticeably longer than a single
+    search would. Scoring per query instead would shorten it at the cost of
+    the batch's guarantee that every query in it sees the same corpus,
+    which is the endpoint's reason to exist. Tracked in ROADMAP.md Phase 5.
     """
 
     def __init__(self, docs_path=None, top_k=None):
@@ -79,11 +125,19 @@ class Retriever:
         self.embed_model = EmbeddingModel(config["vector_model"])
 
         self._ingest_lock = threading.Lock()
-        self._swap_lock = threading.Lock()
+        self._index_lock = threading.Lock()
 
         self._docs_corpus, self._docs_embeddings = self._load_docs_layer()
         self._ingested_chunks, self._ingested_embeddings = self._load_ingested_layer()
-        self._rebuild_combined_corpus()
+
+        # Docs first, then ingested, so slot order matches corpus order and
+        # a compaction can reset the mapping to a plain range.
+        self._bm25 = BM25Index()
+        self._docs_slots = self._bm25.add_documents(self._docs_corpus)
+        self._ingested_slots = self._bm25.add_documents(self._ingested_chunks)
+        with self._index_lock:
+            self._swap_in_combined_corpus()
+
         logger.info(
             "retriever ready: %d docs chunks, %d ingested chunks",
             len(self._docs_corpus), len(self._ingested_chunks),
@@ -155,27 +209,26 @@ class Retriever:
         embeddings, chunks = ingested
         return chunks, embeddings
 
-    def _rebuild_combined_corpus(self):
+    def _swap_in_combined_corpus(self):
         """Rebuild the searchable view from the two layers.
 
-        Builds a whole new BM25 index rather than rebuilding the existing
-        one in place, so a concurrent search either sees the old index or
-        the new one, never one mid-build.
+        Caller must hold _index_lock: these three attributes are what a
+        search reads together, and a search that saw a new corpus against
+        stale embeddings would score chunks against the wrong vectors.
+        Cheap enough to do under the lock -- a list concatenation, one
+        numpy copy and one small integer array -- unlike the BM25 rebuild
+        this used to also perform.
         """
+        # Built into locals first: assigning self.corpus before the vstack
+        # that follows it would, if that allocation failed, leave a corpus
+        # longer than its embedding matrix and make every search raise.
         corpus = self._docs_corpus + self._ingested_chunks
         embeddings = np.vstack([self._docs_embeddings, self._ingested_embeddings])
-        bm25 = BM25Index(corpus)
+        slots = np.asarray(self._docs_slots + self._ingested_slots, dtype=np.intp)
 
-        with self._swap_lock:
-            self.corpus = corpus
-            self.corpus_embeddings = embeddings
-            self._bm25 = bm25
-
-    def _snapshot(self):
-        """Take a consistent view of the three parallel structures, so the
-        rest of a search can run outside the lock."""
-        with self._swap_lock:
-            return self.corpus, self.corpus_embeddings, self._bm25
+        self.corpus = corpus
+        self.corpus_embeddings = embeddings
+        self._bm25_slots = slots
 
     # -- querying ------------------------------------------------------------
 
@@ -186,25 +239,39 @@ class Retriever:
             raise ValueError(f"top_k must be >= 1, got {top_k}")
         return min(top_k, self.max_top_k)
 
-    def _fused_scores(self, query, query_vec, embeddings, bm25):
-        """Blend cosine similarity with normalized BM25 into one score per
-        corpus position. Returns (fused, vector_sims, keyword_sims).
+    def _snapshot(self, queries):
+        """Take a consistent view of the searchable state, and score the
+        keyword half of every query against it.
 
-        Takes the query's embedding rather than computing it, so a batch
-        can embed all its queries in one call to the model.
+        BM25 scoring happens in here, inside the lock, because self._bm25
+        is mutated in place by add_chunks() (see the class docstring).
+        Gathering through _bm25_slots drops tombstoned slots and puts the
+        scores in corpus order, so everything downstream can work in corpus
+        positions and forget slots exist.
         """
+        with self._index_lock:
+            slots = self._bm25_slots
+            return (
+                self.corpus,
+                self.corpus_embeddings,
+                [self._bm25.scores_array(query)[slots] for query in queries],
+            )
+
+    def _fused_scores(self, query_vec, embeddings, keyword_raw):
+        """Blend cosine similarity with normalized BM25 into one score per
+        corpus position. Returns (fused, vector_sims, keyword_sims)."""
         vector_sims = _cosine_similarity(embeddings, query_vec)
         # BM25 scores are unbounded, so normalize to [0, 1] before fusing
         # with cosine similarity -- otherwise a strong keyword match could
         # swamp vector_weight/keyword_weight's intended balance.
-        keyword_sims = np.asarray(normalize(bm25.scores(query)), dtype=float)
+        keyword_sims = normalize_array(keyword_raw)
         fused = self.vector_weight * vector_sims + self.keyword_weight * keyword_sims
         return fused, vector_sims, keyword_sims
 
-    def _rank(self, query, query_vec, corpus, embeddings, bm25, top_k):
+    def _rank(self, query_vec, corpus, embeddings, keyword_raw, top_k):
         """Score one query against a snapshot and shape the winners."""
         fused, vector_sims, keyword_sims = self._fused_scores(
-            query, query_vec, embeddings, bm25
+            query_vec, embeddings, keyword_raw
         )
         # Rank on the score array, then build result dicts only for the
         # chunks actually being returned. The previous version built a dict
@@ -234,34 +301,101 @@ class Retriever:
         top_k = self._resolve_top_k(top_k)
         if not queries:
             return []
-        corpus, embeddings, bm25 = self._snapshot()
-        if not corpus:
+        # Read without the lock purely as a fast path, so an ingest-only
+        # deployment that hasn't ingested anything yet doesn't run the
+        # embedding model to answer with nothing. It's a single attribute
+        # read, and the worst a race costs is one wasted encode.
+        if not self.corpus:
             return [[] for _ in queries]
 
         query_vecs = self.embed_model.encode(list(queries))
+        corpus, embeddings, keyword_scores = self._snapshot(queries)
+        return self._rank_batch(query_vecs, corpus, embeddings, keyword_scores, top_k)
+
+    def _rank_batch(self, query_vecs, corpus, embeddings, keyword_scores, top_k):
+        """Rank every query in a batch against one snapshot.
+
+        The corpus is re-checked here rather than trusted from the fast path
+        above: between that read and the snapshot it can only have grown,
+        but a corpus that is still empty at snapshot time would index into
+        empty arrays.
+        """
+        if not corpus:
+            return [[] for _ in keyword_scores]
         return [
-            self._rank(query, vec, corpus, embeddings, bm25, top_k)
-            for query, vec in zip(queries, query_vecs)
+            self._rank(query_vec, corpus, embeddings, keyword_raw, top_k)
+            for query_vec, keyword_raw in zip(query_vecs, keyword_scores)
         ]
 
     # -- ingestion -----------------------------------------------------------
 
-    def _drop_ingested_sources(self, sources):
-        """Remove any already-ingested chunks whose source is in `sources`.
+    def _without_sources(self, sources):
+        """The ingested layer with `sources` removed, computed but not
+        applied. Returns (chunks, slots, embeddings, slots_to_tombstone).
 
-        Called before adding new chunks for a page, so re-ingesting a URL
-        replaces its old content instead of accumulating duplicate chunks
-        alongside it forever in the persisted store.
+        Deliberately free of side effects. add_chunks() builds the whole new
+        layer before assigning any of it, so that an allocation failure part
+        way through leaves the retriever exactly as it was rather than with
+        a chunk list longer than its embedding matrix -- a mismatch that
+        would make every subsequent search raise, and would be persisted.
         """
-        if not self._ingested_chunks:
-            return
-        keep = np.array(
-            [c["source"] not in sources for c in self._ingested_chunks], dtype=bool
+        keep = [c["source"] not in sources for c in self._ingested_chunks]
+        if all(keep):
+            return self._ingested_chunks, self._ingested_slots, self._ingested_embeddings, []
+        return (
+            _where(self._ingested_chunks, keep),
+            _where(self._ingested_slots, keep),
+            self._ingested_embeddings[np.array(keep, dtype=bool)],
+            _where(self._ingested_slots, keep, wanted=False),
         )
-        if keep.all():
+
+    def _publish(self, chunks, kept_slots, dead_slots, merged):
+        """Make a prepared layer the live one, under _index_lock.
+
+        Everything in here is proportional to what changed rather than to
+        the size of the corpus, which is what makes holding the read lock
+        across it acceptable. Compaction is the exception, and runs outside
+        the lock for exactly that reason.
+        """
+        merged_chunks, merged_embeddings = merged
+        with self._index_lock:
+            self._bm25.remove_slots(dead_slots)
+            self._ingested_slots = kept_slots + self._bm25.add_documents(chunks)
+            self._ingested_chunks = merged_chunks
+            self._ingested_embeddings = merged_embeddings
+            self._swap_in_combined_corpus()
+
+    def _compact_if_worthwhile(self):
+        """Reclaim tombstoned BM25 slots once enough have accumulated.
+
+        The compacted index is built before the lock is taken, because
+        re-keying every posting list is proportional to the whole index
+        (600ms at 20k chunks half-tombstoned) and doing that with readers
+        excluded would stall every concurrent search for the duration.
+        Reading self._bm25 here without the lock is safe: only ingest
+        mutates it, and _ingest_lock is held.
+
+        Compaction renumbers, invalidating every slot this class holds.
+        That's recoverable in three lines only because it preserves
+        insertion order and this corpus is laid out in that same order:
+        docs first, then ingested. Both mappings become plain ranges again.
+        """
+        index = self._bm25
+        if index.tombstones < _COMPACT_MIN_TOMBSTONES:
             return
-        self._ingested_chunks = [c for c, k in zip(self._ingested_chunks, keep) if k]
-        self._ingested_embeddings = self._ingested_embeddings[keep]
+        if index.tombstones < _COMPACT_TOMBSTONE_RATIO * index.size:
+            return
+
+        compacted = index.compacted()
+        docs_count = len(self._docs_corpus)
+        with self._index_lock:
+            self._bm25 = compacted
+            self._docs_slots = list(range(docs_count))
+            self._ingested_slots = list(
+                range(docs_count, docs_count + len(self._ingested_chunks))
+            )
+            self._swap_in_combined_corpus()
+        logger.info("compacted the keyword index to %d slots", compacted.size)
 
     def add_chunks(self, chunks):
         """Embed `chunks`, replace any existing chunks that share a
@@ -270,26 +404,34 @@ class Retriever:
         Used by the ingest pipeline (scout.web) so a freshly-fetched page
         is searchable immediately. Re-ingesting a URL that's already in the
         ingested store drops its old chunks first, so the store holds one
-        version per source instead of piling up duplicates. This still
-        isn't the real Phase 2 vector store (see ROADMAP.md): every call
-        rewrites the whole ingested store to disk, which is fine at
-        prototype scale but not how this should work once ingest volume
-        grows.
+        version per source instead of piling up duplicates.
+
+        Ordered so that the durable write happens before the page becomes
+        searchable. The reverse would mean a failed write returns an error
+        to the caller while the page is live in memory and absent from
+        disk, so it would serve results until the next restart and then
+        vanish without anything having reported a problem.
+
+        Embedding and the disk write are the slow parts and both happen
+        outside _index_lock. The write is still a full rewrite of the
+        ingested store, which is the remaining O(everything) step and the
+        next item in ROADMAP.md Phase 2.
         """
         if not chunks:
             return
 
         sources = {c["source"] for c in chunks}
         # Embedding is the slow part and touches no shared state, so it runs
-        # before the lock is taken.
+        # before either lock is taken.
         new_embeddings = self.embed_model.encode([c["content"] for c in chunks])
 
         with self._ingest_lock:
-            self._drop_ingested_sources(sources)
-            self._ingested_chunks = self._ingested_chunks + list(chunks)
-            self._ingested_embeddings = np.vstack(
-                [self._ingested_embeddings, new_embeddings]
+            kept_chunks, kept_slots, kept_embeddings, dead_slots = self._without_sources(sources)
+            merged = (
+                kept_chunks + list(chunks),
+                np.vstack([kept_embeddings, new_embeddings]),
             )
-            save_ingested(self._ingested_embeddings, self._ingested_chunks)
-            self._rebuild_combined_corpus()
+            save_ingested(merged[1], merged[0])
+            self._publish(chunks, kept_slots, dead_slots, merged)
+            self._compact_if_worthwhile()
         logger.info("indexed %d chunks from %d source(s)", len(chunks), len(sources))

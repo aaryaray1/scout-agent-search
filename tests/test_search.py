@@ -255,3 +255,144 @@ def test_search_many_validates_top_k_once_for_the_batch():
     retriever = Retriever()
     with pytest.raises(ValueError):
         retriever.search_many(["a", "b"], top_k=0)
+
+
+# -- keyword index alignment -------------------------------------------------
+#
+# self._bm25 addresses chunks by slot, and removals leave tombstones behind
+# rather than shifting slots, so self._bm25_slots is what keeps BM25 scores
+# attached to the chunk they were computed for. Getting that mapping wrong
+# does not raise: it silently attributes every keyword score to the wrong
+# document, which is the failure these cover.
+
+
+def _page(source, term, count=1):
+    return [
+        {
+            "id": f"{source}-{i}",
+            "content": f"Document about {term} number {i} and other filler words.",
+            "source": source,
+            "type": "web",
+            "order": i,
+        }
+        for i in range(count)
+    ]
+
+
+def test_keyword_scores_stay_attached_to_their_chunk_after_a_replacement():
+    """Re-ingesting a source tombstones its slots. Every surviving chunk
+    keeps its old slot, so the mapping has to drop exactly the dead entries
+    and nothing else."""
+    retriever = Retriever()
+    for source, term in [("s://a", "quernstone"), ("s://b", "bandersnatch"), ("s://c", "flimflammery")]:
+        retriever.add_chunks(_page(source, term))
+
+    # Replace the middle source, which tombstones a slot in the middle of
+    # the ingested layer: an off-by-one in the mapping shows up here and
+    # not when only the last source is replaced.
+    retriever.add_chunks(_page("s://b", "wobblegong"))
+
+    for term, expected in [
+        ("quernstone", "s://a"),
+        ("flimflammery", "s://c"),
+        ("wobblegong", "s://b"),
+    ]:
+        top = retriever.search(term, top_k=1)[0]
+        assert top["source"] == expected, f"'{term}' resolved to {top['source']}"
+        assert top["metadata"]["keyword_score"] > 0
+
+
+def test_replacing_a_large_source_compacts_the_keyword_index():
+    """Tombstones accumulate until compaction reclaims them. Compaction
+    renumbers every slot, so the mapping has to be rebuilt with it."""
+    retriever = Retriever()
+    retriever.add_chunks(_page("s://big", "zephyrology", count=40))
+    assert retriever._bm25.tombstones == 0
+
+    retriever.add_chunks(_page("s://big", "quinquagenary", count=40))
+
+    assert retriever._bm25.tombstones == 0, "compaction should have reclaimed the slots"
+    assert retriever._bm25.size == len(retriever.corpus)
+    assert len(retriever._bm25_slots) == len(retriever.corpus)
+
+    top = retriever.search("quinquagenary", top_k=1)[0]
+    assert top["source"] == "s://big"
+    assert top["metadata"]["keyword_score"] > 0
+    # The replaced version must be gone from the keyword index too, not
+    # merely outranked by the new one.
+    assert all(
+        result["metadata"]["keyword_score"] == 0.0
+        for result in retriever.search("zephyrology", top_k=3)
+    )
+
+
+def test_slot_mapping_stays_the_same_length_as_the_corpus():
+    retriever = Retriever()
+    for i in range(3):
+        retriever.add_chunks(_page(f"s://page-{i}", "widget", count=2))
+        assert len(retriever._bm25_slots) == len(retriever.corpus)
+
+    retriever.add_chunks(_page("s://page-1", "widget", count=5))
+    assert len(retriever._bm25_slots) == len(retriever.corpus)
+    assert retriever.corpus_embeddings.shape[0] == len(retriever.corpus)
+
+
+# -- failure part way through an ingest --------------------------------------
+#
+# add_chunks() touches the keyword index, two parallel lists, an embedding
+# matrix and a file. A failure in the middle used to be able to leave those
+# disagreeing with each other, which does not raise at the time: it surfaces
+# later as every search failing, or as a page that serves results until the
+# next restart and then silently disappears.
+
+
+def test_a_failed_write_leaves_the_page_unsearchable(monkeypatch):
+    """Durable before searchable. If the store write fails the caller gets
+    an error, and the page must not be live in memory: it would answer
+    queries until the next restart and then vanish with nothing having
+    reported a problem."""
+    import scout.search as search_module
+
+    retriever = Retriever()
+    before = len(retriever.corpus)
+
+    def failing_write(*args, **kwargs):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(search_module, "save_ingested", failing_write)
+    with pytest.raises(OSError):
+        retriever.add_chunks(_page("s://unwritable", "sesquipedalian"))
+
+    assert len(retriever.corpus) == before
+    assert all(
+        result["metadata"]["keyword_score"] == 0.0
+        for result in retriever.search("sesquipedalian", top_k=3)
+    )
+
+
+def test_a_failed_merge_leaves_the_retriever_usable(monkeypatch):
+    """The parallel structures are built before any of them is assigned, so
+    an allocation failure part way through is survivable. Without that, the
+    chunk list outgrows the embedding matrix and every subsequent search
+    raises on the mismatch."""
+    import scout.search as search_module
+
+    retriever = Retriever()
+    retriever.add_chunks(_page("s://first", "widget"))
+    before = len(retriever.corpus)
+
+    real_vstack = search_module.np.vstack
+    monkeypatch.setattr(
+        search_module.np, "vstack", lambda *a, **k: (_ for _ in ()).throw(MemoryError())
+    )
+    with pytest.raises(MemoryError):
+        retriever.add_chunks(_page("s://second", "widget"))
+    monkeypatch.setattr(search_module.np, "vstack", real_vstack)
+
+    assert len(retriever.corpus) == before
+    assert retriever.corpus_embeddings.shape[0] == len(retriever.corpus)
+    assert len(retriever._bm25_slots) == len(retriever.corpus)
+    # Still serving, and a later ingest still works.
+    assert retriever.search("widget", top_k=1)
+    retriever.add_chunks(_page("s://third", "widget"))
+    assert len(retriever.corpus) == before + 1
