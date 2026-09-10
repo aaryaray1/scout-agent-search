@@ -1,9 +1,7 @@
 """API-key auth, at both the unit and the HTTP level.
 
-The HTTP tests go through a TestClient built while SCOUT_API_KEYS is set,
-because the app reads its keys once in the lifespan handler -- which is
-also the behaviour worth pinning down: keys come from the environment at
-startup, not from a per-request lookup.
+The HTTP tests set SCOUT_API_KEYS before building the client, pinning down
+that keys come from the environment at startup, not per request.
 """
 import pytest
 from fastapi import HTTPException

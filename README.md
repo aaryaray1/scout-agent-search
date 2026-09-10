@@ -6,17 +6,39 @@ Search built for agents, not browsers.
 
 An agent that pulls information from the web gets raw HTML back and has to parse it into something usable before it can reason over it. Every agent repeats that step, on every fetch. Scout does it once and returns structured JSON instead of markup.
 
+Reading a page costs an agent the whole page. Scout indexes it and hands back only the passages that answer the question, so ten pages cost roughly what one used to.
+
+## Use it from an agent
+
+Scout ships as an MCP server, so an agent gets web ingestion and search as tools with no service to deploy:
+
+```bash
+pip install "scout-agent-search[mcp]"
+```
+
+```json
+{"mcpServers": {"scout": {"command": "scout-mcp"}}}
+```
+
+That gives the agent two tools:
+
+- **`ingest(urls)`** fetches pages, strips the boilerplate, indexes them, and returns a short summary per page rather than the page body. The summary is the same size whether the page was 300 words or 30,000.
+- **`search(query, top_k)`** returns only the passages that answer the question, from everything ingested so far, including in earlier sessions.
+
+Point it at a shared Scout instead of running one in-process with `scout-mcp --url https://scout.example.com`. Both are the same two tools over the same response shape. [docs/design/mcp.md](docs/design/mcp.md) covers the design.
+
 ## What's here
 
 - Local hybrid search (vector + BM25 keyword) over a markdown corpus: `scout/ingest.py`, `scout/embeddings.py`, `scout/bm25.py`, `scout/index.py`, `scout/search.py`. Served as `POST /api/v1/search`.
 - HTML ingestion: fetch a URL or accept raw HTML, extract clean content with `trafilatura`, chunk it, index it. `scout/fetch.py`, `scout/webextract.py`, `scout/web.py`. Served as `POST /api/v1/ingest`. Ingested pages persist to disk and survive a restart, and re-ingesting the same URL replaces its content instead of duplicating it.
 - Batch endpoints for agents that fan out: `POST /api/v1/search/batch` and `POST /api/v1/ingest/batch`. A batch of queries is answered against one corpus snapshot; a batch of pages is indexed in one write, and a page that fails fails alone.
 - API-key auth (`scout/auth.py`) and per-caller ingest rate limiting (`scout/ratelimit.py`) on the `/api/v1` surface.
+- An MCP server exposing search and ingest as agent tools, in-process or against a running Scout: `scout/mcp.py`.
 - A Python client so agent frameworks don't hand-roll HTTP: `scout/client.py`.
 
-The keyword index is incremental: an ingest updates only the pages that changed rather than rebuilding, so its cost is flat in the size of the corpus instead of linear. [docs/architecture/adr-001-incremental-index.md](docs/architecture/adr-001-incremental-index.md) has the measurements, and why a vector database is deferred rather than adopted.
+Neither half of an ingest costs the size of the corpus any more. The keyword index is incremental, so an ingest updates the page that changed rather than re-tokenizing everything, and the durable store appends one immutable segment per ingest instead of rewriting every page ever ingested. Measurements and the reasoning: [docs/architecture/adr-001-incremental-index.md](docs/architecture/adr-001-incremental-index.md) and [docs/design/storage.md](docs/design/storage.md).
 
-Ingestion is a first pass, not a finished pipeline. See [ROADMAP.md](ROADMAP.md) for what's missing (a store that appends instead of rewriting, JS-rendered pages, a rate limit shared across workers).
+Ingestion is a first pass, not a finished pipeline. See [ROADMAP.md](ROADMAP.md) for what's missing (JS-rendered pages, near-duplicate detection, a rate limit shared across workers).
 
 ## Quickstart
 
@@ -115,6 +137,7 @@ The environment layer wins so a deployment can be reconfigured without editing f
 | `vector_model` | `SCOUT_VECTOR_MODEL` | `all-MiniLM-L6-v2` | sentence-transformers model used for embeddings |
 | `docs_path` | `SCOUT_DOCS_PATH` | `data/docs` | folder of markdown documents to index at startup |
 | `index_dir` | `SCOUT_INDEX_DIR` | `data/index` | where the embedding cache and ingested store are written |
+| `chunk_store` | `SCOUT_CHUNK_STORE` | `segmented` | how ingested pages are persisted; `json` rewrites the whole store per ingest |
 | `top_k` | `SCOUT_TOP_K` | `3` | default result count when a request doesn't specify one |
 | `vector_weight` / `keyword_weight` | `SCOUT_VECTOR_WEIGHT` / `SCOUT_KEYWORD_WEIGHT` | `0.65` / `0.35` | score-fusion balance |
 | `chunk_size` / `chunk_overlap` | `SCOUT_CHUNK_SIZE` / `SCOUT_CHUNK_OVERLAP` | `400` / `50` | chunking window, in words |
@@ -141,6 +164,8 @@ SCOUT_DOCS_PATH=/var/empty SCOUT_INDEX_DIR=/data/scout \
 
 **State.** Everything durable lives under `index_dir`: the docs-corpus embedding cache (rebuildable) and the ingested-page store (not). Mount it on a volume. The two are treated differently on corruption: a damaged docs cache degrades to a cache miss and re-embeds, while a damaged ingested store raises rather than starting up empty and letting the next ingest overwrite recoverable data. Every write goes through a temp file and an atomic rename, so a crash mid-write leaves the previous good file in place.
 
+The ingested store is a run of append-only segments plus a manifest. An ingest writes one new segment and never touches an existing one, so its cost is the page rather than the store; superseded pages are reclaimed by a merge once enough accumulate. Crash safety falls out of the write ordering rather than needing a lock: segments land first and are inert until the manifest names them. An older `data/index/ingested_*.json` store is imported automatically on first start.
+
 **Concurrency.** The endpoints are sync, so Starlette runs them in its threadpool and a search can land mid-ingest. `Retriever` guards the searchable view - corpus, embeddings, slot mapping and keyword index - with one lock, held on both the read and the write side, because the keyword index is updated in place rather than rebuilt and swapped. That is affordable because an update costs the page being ingested rather than the whole corpus, and because keyword scoring is pure Python and already serialized by the GIL. Query embedding, the similarity scan and disk writes all happen outside the lock. See `tests/test_concurrency.py`.
 
 **Auth.** Set `SCOUT_API_KEYS` to one or more comma-separated keys and every `/api/v1` route requires an `X-API-Key` header matching one of them. Keys are compared in constant time and never logged: callers are identified downstream by a short hash of the key they presented.
@@ -151,7 +176,7 @@ SCOUT_API_KEYS="$(openssl rand -hex 24)" uvicorn scout.api:app --host 0.0.0.0
 
 With no keys set there is no auth at all, which is right for a laptop and wrong for anything reachable, so startup logs which of the two it is and `/health` reports `"auth": "enabled" | "disabled"`, since "did my keys reach the container" shouldn't only be answerable by getting rejected. `/` and `/health` stay open so a liveness probe doesn't need a credential.
 
-**Rate limiting.** `/api/v1/ingest` and `/api/v1/ingest/batch` are limited per caller (per key, or per client IP when auth is off), since ingest is the endpoint that spends Scout's network on hosts the caller chooses. A batch costs one unit per item, so it can't be used to make N outbound fetches for the price of one. Exceeding it returns 429 with a `Retry-After` header. The bucket is in-process, so N uvicorn workers means N times the configured limit; a shared store is ROADMAP Phase 2 work.
+**Rate limiting.** `/api/v1/ingest` and `/api/v1/ingest/batch` are limited per caller (per key, or per client IP when auth is off), since ingest is the endpoint that spends Scout's network on hosts the caller chooses. A batch costs one unit per item, so it can't be used to make N outbound fetches for the price of one. Exceeding it returns 429 with a `Retry-After` header. The bucket is in-process, so N uvicorn workers means N times the configured limit; a shared store is ROADMAP Phase 5 work.
 
 **Limits.** Request-shape caps are declared on the Pydantic models, so they appear in `/openapi.json` (including the batch ceilings and the API-key security scheme) and an agent can discover them instead of finding them via a 422. Outbound fetches are capped by streaming the response and stopping at the byte limit, rather than trusting `Content-Length`.
 
@@ -161,9 +186,9 @@ With no keys set there is no auth at all, which is right for a laptop and wrong 
 pytest
 ```
 
-197 tests, no network access required. The suite covers the SSRF/redirect/size guards against a mock transport, storage corruption and atomicity, config layering, concurrent search-during-ingest, incremental keyword-index updates and their slot mapping, the storage interface, auth and rate limiting, batch fan-out, the Python client against the real ASGI app, and the HTTP layer end to end.
+240 tests, no network access required. The suite covers the SSRF/redirect/size guards against a mock transport, storage corruption and atomicity, config layering, concurrent search-during-ingest, incremental keyword-index updates and their slot mapping, both storage backends against one shared contract, auth and rate limiting, batch fan-out, the Python client against the real ASGI app, the MCP tools through the MCP server itself, and the HTTP layer end to end.
 
-Tests for the guards are written against a deliberately broken version first: an auth check that always matches, a limiter that never evicts, a batch charged as one request, a keyword index that renumbers slots instead of tombstoning them. A test that still passes against the bug it describes is worse than no test.
+Tests for the guards are written against a deliberately broken version first: an auth check that always matches, a limiter that never evicts, a batch charged as one request, a keyword index that renumbers slots instead of tombstoning them, a store that commits a segment before writing it. A test that still passes against the bug it describes is worse than no test.
 
 Complexity is tracked with `radon`:
 
@@ -185,14 +210,17 @@ It reports what an ingest and a query cost at increasing corpus sizes. The numbe
 
 ```
 scout/          package: ingest, embed, bm25, index, search, fetch, webextract, web,
-                api, auth, ratelimit, client, cli, config, logsetup
+                api, auth, ratelimit, client, mcp, cli, config, logsetup
 scout/store/    storage backends for ingested pages, behind one interface
 data/docs/      markdown source documents (demo corpus)
 data/index/     generated embedding cache + persisted ingested pages, git-ignored
-docs/           architecture decision records
+docs/design/    how each part works and why
+docs/architecture/  decision records, with the measurements behind them
 scripts/        benchmarks
 tests/          pytest suite
 ```
+
+Code carries short comments and points at [docs/design/](docs/design/), which is where the reasoning lives.
 
 ## License
 

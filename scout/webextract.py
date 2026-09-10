@@ -1,9 +1,7 @@
-"""HTML -> structured content extraction.
+"""HTML to markdown + metadata, via trafilatura.
 
-Delegates boilerplate removal (nav, ads, cookie banners, etc.) to
-trafilatura and asks it for markdown output, so the result slots straight
-into scout.ingest.chunk_docs: the same chunking path the local markdown
-corpus already goes through.
+Markdown output so the result slots into the same chunking path the local
+markdown corpus uses. See docs/design/ingestion.md.
 """
 import logging
 
@@ -11,11 +9,8 @@ import trafilatura
 
 logger = logging.getLogger(__name__)
 
-# Tables and multi-line code blocks survive as markdown by default; links
-# are kept too so citations in the source page (e.g. "see the related
-# docs") carry their real URL into the evidence instead of being flattened
-# to plain text. Images are left out: an image URL alone isn't useful
-# evidence for a text-based agent, and there's no rendering surface for it.
+# Links are kept so citations carry their real URL into the evidence;
+# images are not, being useless to a text-only agent.
 _EXTRACT_OPTIONS = {
     "output_format": "markdown",
     "include_links": True,
@@ -34,11 +29,10 @@ def _extract_markdown(html: str, url: str) -> str:
 
 
 def _extract_metadata(html: str, url: str):
-    """Return (title, metadata) for the page.
+    """Return (title, metadata), keeping the metadata shape constant.
 
-    trafilatura returns None when it can't read any metadata at all, which
-    is common for fragments and error pages, so the shape of the metadata
-    dict stays the same either way and callers never branch on it.
+    trafilatura returns None for fragments and error pages, so callers
+    never have to branch on it.
     """
     meta = trafilatura.extract_metadata(html, default_url=url)
     if meta is None:
@@ -50,12 +44,10 @@ def _extract_metadata(html: str, url: str):
 
 
 def extract_content(html: str, url: str = None) -> dict:
-    """Extract main content + metadata from raw HTML.
+    """Extract main content + metadata as {"title", "content", "metadata"}.
 
-    Returns {"title": str, "content": str (markdown), "metadata": dict}.
-    Raises ValueError if trafilatura finds nothing extractable, e.g. the
-    page is a login wall, an error page, or its content is JS-rendered
-    (Scout does not execute JavaScript; see ROADMAP.md).
+    Raises ValueError when there is nothing extractable: a login wall, an
+    error page, or JS-rendered content, which Scout does not execute.
     """
     content = _extract_markdown(html, url)
     title, metadata = _extract_metadata(html, url)

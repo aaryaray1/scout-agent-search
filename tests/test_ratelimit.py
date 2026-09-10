@@ -1,9 +1,7 @@
 """Per-caller ingest rate limiting.
 
-The unit tests drive the bucket with an injected clock rather than
-sleeping, so they assert the refill arithmetic exactly instead of racing
-wall time. The HTTP tests only need to show that the limit is wired to
-the right endpoints and charged the right amount.
+The unit tests drive the bucket with an injected clock, so the refill
+arithmetic is asserted exactly rather than raced against wall time.
 """
 import pytest
 from fastapi.testclient import TestClient

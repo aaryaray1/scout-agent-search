@@ -1,9 +1,7 @@
 """HTTP-level tests for the FastAPI app.
 
-Each test gets its own TestClient context, which triggers scout.api's
-lifespan handler (building a fresh Retriever) while that test's
-isolate_index_dir fixture (tests/conftest.py) is already active, so these
-tests never touch the real project's data/index/.
+Each test gets its own TestClient context, so the lifespan handler builds a
+fresh Retriever while isolate_index_dir is already redirecting the store.
 """
 import pytest
 from fastapi.testclient import TestClient

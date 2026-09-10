@@ -2,3 +2,4 @@
 pytest
 httpx
 radon
+mcp>=2,<3

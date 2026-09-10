@@ -1,8 +1,7 @@
 """Loading documents and splitting them into indexable chunks.
 
-Both the local markdown corpus and pages pulled off the web converge on
-the same doc shape here, so chunk_docs() is the single chunking path for
-everything Scout indexes.
+Local markdown and fetched web pages converge on the same doc shape here,
+so chunk_docs() is the single chunking path. See docs/design/ingestion.md.
 """
 import logging
 import uuid
@@ -12,8 +11,7 @@ from .config import load_config
 
 logger = logging.getLogger(__name__)
 
-# Fields chunk_docs() sets itself; everything else on a doc is an extra
-# that gets carried onto each chunk.
+# Set by chunk_docs(); anything else on a doc is carried onto each chunk.
 _CORE_FIELDS = {"id", "content", "source", "type"}
 
 DEFAULT_TYPE = "documentation"
@@ -32,17 +30,11 @@ def load_markdown_docs(path="data/docs"):
 
 
 def chunk_text(text, chunk_size=None, overlap=None):
-    """Split `text` into overlapping fixed-size word windows.
-
-    Chunking by word count ignores document structure and can split
-    mid-section; chunking by heading would preserve more meaning per chunk
-    (tracked in ROADMAP.md Phase 0).
-    """
+    """Split `text` into overlapping fixed-size word windows."""
     config = load_config()
     chunk_size = config["chunk_size"] if chunk_size is None else chunk_size
     overlap = config["chunk_overlap"] if overlap is None else overlap
-    # The window advances by (chunk_size - overlap). A non-positive stride
-    # would re-emit the same words forever, so refuse it rather than hang.
+    # A non-positive stride re-emits the same words forever.
     stride = chunk_size - overlap
     if stride < 1:
         raise ValueError(
@@ -57,11 +49,8 @@ def chunk_text(text, chunk_size=None, overlap=None):
 
 
 def doc_from_web_content(extracted, source_url):
-    """Build a doc dict from scout.webextract.extract_content()'s output.
-
-    Shaped to match load_markdown_docs()'s output so it flows through
-    chunk_docs() unchanged: {"source", "content", "type", ...}.
-    """
+    """Shape extractor output like load_markdown_docs() output, so it flows
+    through chunk_docs() unchanged."""
     return {
         "source": source_url,
         "content": extracted["content"],
@@ -75,9 +64,7 @@ def doc_from_web_content(extracted, source_url):
 def _chunks_for_doc(doc):
     """Split one doc into chunk dicts, carrying its extra fields along.
 
-    Never writes back to `doc`: callers hand in their own dicts (the CLI
-    reuses them for logging, tests assert on them), and a chunker that
-    quietly stamps an id onto its input is a trap for the next caller.
+    Never writes back to `doc`: callers reuse their own dicts afterwards.
     """
     doc_id = doc.get("id") or str(uuid.uuid4())
     doc_type = doc.get("type", DEFAULT_TYPE)

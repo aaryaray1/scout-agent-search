@@ -20,10 +20,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "httpx", "radon"]
+# The MCP server is an extra so the HTTP service doesn't carry the SDK.
+# Pinned to 2.x: 1.x exposes FastMCP where 2.x exposes MCPServer.
+mcp = ["mcp>=2,<3"]
+dev = ["pytest", "httpx", "radon", "mcp>=2,<3"]
 
 [project.scripts]
 scout-ingest = "scout.cli:main"
+scout-mcp = "scout.mcp:main"
 
 [tool.setuptools.packages.find]
 include = ["scout*"]

@@ -1,40 +1,15 @@
-"""Benchmark the index paths that Phase 2 is about.
+"""Benchmark the keyword index, the vector scan and the durable store.
 
-The numbers in ROADMAP.md and docs/architecture/adr-001-incremental-index.md
-came from this script, so they can be re-checked rather than trusted.
-
-Deliberately does not load the embedding model. The costs being measured
-here are tokenization, posting-list maintenance, the similarity scan and the
-store write; an embedding model would add a large constant to every row and
-make the shape of the growth harder to see. Vector similarity is measured
-against random vectors of the right width for the same reason.
-
-Word frequencies follow a Zipf distribution rather than a uniform one.
-Drawing 400 words uniformly from an 8k vocabulary yields a chunk with about
-390 distinct terms, which no real document has; Zipf yields about 237, which
-is in the right range for English prose. The distribution matters here
-because it sets both how much work indexing a document is and how long the
-posting lists a query walks are, and uniform draws flatter the query numbers
-while inflating the indexing ones.
-
-Timing takes the minimum of several trials with the collector disabled
-during each. These structures allocate heavily enough that a GC pause landing
-inside a timed region moves the result by more than the thing being measured.
-
-Absolute figures are machine-state dependent and are not comparable across
-runs: measured on a busy desktop, every column here (including the ones no
-Scout code touches) runs roughly 3x slower than on an idle one. Compare
-columns within a single run, not numbers between runs. The ratio between the
-cold-build column and the add column is the load-bearing result, and it holds
-at roughly three orders of magnitude regardless of machine state.
+Compare columns within a run, never numbers between runs: machine state
+moves every column, including ones no Scout code touches. Methodology and
+caveats: docs/design/benchmarks.md.
 
     python scripts/bench_index.py
     python scripts/bench_index.py --sizes 1000,5000,20000,100000
 """
 import argparse
 import gc
-import json
-import os
+import itertools
 import random
 import string
 import sys
@@ -47,6 +22,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scout.bm25 import BM25Index  # noqa: E402
+from scout.index import save_ingested  # noqa: E402
+from scout.store import JsonChunkStore, SegmentedChunkStore  # noqa: E402
 
 CHUNK_WORDS = 400  # matches the default chunk_size in scout/config.py
 VOCAB_SIZE = 8000
@@ -81,11 +58,8 @@ def _corpus(rng, vocab, weights, n_chunks):
 
 
 def _best(fn, repeats=1):
-    """Fastest of TRIALS runs, in milliseconds, with GC held off inside each
-    timed region. Minimum rather than mean: the noise here is all additive
-    (a GC pause, the scheduler), so the fastest run is the closest to the
-    real cost.
-    """
+    """Fastest of TRIALS runs in ms, GC held off inside each timed region.
+    Minimum, not mean: the noise here is all additive."""
     timings = []
     for _ in range(TRIALS):
         gc.collect()
@@ -101,19 +75,11 @@ def _best(fn, repeats=1):
 
 
 def _time_one_add(index, page):
-    """Time one add, then undo it so the next trial measures the same index.
+    """Time one add, then tombstone it so the next trial measures the same
+    index rather than one the previous repeat grew.
 
-    Repeating an add against an index without undoing it grows the index,
-    so each repeat is measured against a bigger corpus than the last and
-    the result describes an index that never existed. Rebuilding a fresh
-    index per trial would fix that but allocates several more copies of the
-    corpus, and at 20k chunks that costs more in collector pressure than
-    the measurement is worth.
-
-    Tombstoning the slots that were just added is enough to undo it: it
-    restores the live document count and the corpus statistics an add
-    depends on, and leaves behind only a handful of dead slots, which an
-    add never touches.
+    Tombstoning restores the statistics an add depends on without
+    reallocating the corpus, which a fresh index per trial would.
     """
     gc.collect()
     gc.disable()
@@ -158,24 +124,30 @@ def _bench_vector(n_chunks):
     return _best(scan, repeats=REPEATS), embeddings
 
 
-def _bench_store_write(corpus, embeddings):
-    """What save_ingested() costs today: the whole store, every ingest.
+def _bench_store_write(store_class, corpus, embeddings):
+    """One ingest against a store already holding `corpus`, through the same
+    ChunkStore call for both backends so the columns are comparable.
 
-    This is the remaining O(everything) step, and the next Phase 2 item.
+    Each timed call uses a fresh source, as a real ingest does; repeating one
+    would pile up dead chunks and eventually time a merge instead.
     """
+    page = corpus[:PAGE_CHUNKS]
+    page_embeddings = embeddings[:PAGE_CHUNKS]
+    counter = itertools.count()
+
     with tempfile.TemporaryDirectory() as directory:
-        # The directory is created and torn down outside the timed region.
-        # Leaving it inside measured mkdir plus a recursive delete of a
-        # 30MB file alongside the write, which is not what save_ingested
-        # costs. Rewriting the same paths each trial also matches what the
-        # real store does.
-        embeddings_path = os.path.join(directory, "ingested_embeddings.npy")
-        meta_path = os.path.join(directory, "ingested_meta.json")
+        # Seeded, and the directory created and torn down, outside the timed
+        # region: leaving either inside would measure mkdir and a recursive
+        # delete of a 30MB store alongside the write.
+        save_ingested(embeddings, corpus, index_dir=directory)
+        store = store_class(index_dir=directory)
+        store.load()
 
         def write():
-            np.save(embeddings_path, embeddings)
-            with open(meta_path, "w", encoding="utf-8") as f:
-                json.dump(corpus, f, indent=2)
+            source = f"https://example.com/new-{next(counter)}"
+            store.upsert(
+                [dict(chunk, source=source) for chunk in page], page_embeddings
+            )
 
         return _best(write)
 
@@ -186,11 +158,12 @@ def _row(n_chunks, rng, vocab, weights):
 
     cold_build, add, query_time = _bench_keyword(corpus, query)
     vector_time, embeddings = _bench_vector(n_chunks)
-    write_time = _bench_store_write(corpus, embeddings)
+    full_write = _bench_store_write(JsonChunkStore, corpus, embeddings)
+    segment_write = _bench_store_write(SegmentedChunkStore, corpus, embeddings)
 
     return (
         f"| {n_chunks:,} | {cold_build:,.0f}ms | {add:.2f}ms | {query_time:.1f}ms "
-        f"| {vector_time:.1f}ms | {write_time:,.0f}ms |"
+        f"| {vector_time:.1f}ms | {full_write:,.0f}ms | {segment_write:.2f}ms |"
     )
 
 
@@ -212,8 +185,8 @@ def main():
         f"{EMBEDDING_DIM}-dim vectors, best of {TRIALS}\n"
     )
     print("| chunks | keyword cold build | keyword add (per ingest) | keyword query "
-          "| vector query | full store rewrite (per ingest) |")
-    print("| --- | --- | --- | --- | --- | --- |")
+          "| vector query | store write, full rewrite | store write, segmented |")
+    print("| --- | --- | --- | --- | --- | --- | --- |")
     for size in (int(s) for s in args.sizes.split(",")):
         print(_row(size, rng, vocab, weights))
 

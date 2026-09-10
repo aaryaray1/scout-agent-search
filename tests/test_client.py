@@ -1,10 +1,8 @@
 """The Python client, driven against the real app.
 
-TestClient is itself an httpx.Client, so handing it to ScoutClient runs
-every call through the actual ASGI stack -- routing, auth, validation,
-retrieval -- without a socket or a server process. That's the whole
-reason ScoutClient takes an injectable client: the same seam serves
-tests, proxies and custom transports.
+TestClient is an httpx.Client, so injecting it runs every call through the
+real ASGI stack with no socket -- the same seam that serves proxies and
+custom transports.
 """
 import httpx
 import pytest

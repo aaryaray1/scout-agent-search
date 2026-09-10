@@ -1,18 +1,7 @@
-"""On-disk persistence for both corpus layers.
+"""On-disk persistence for both corpus layers, with every write atomic.
 
-Two stores live side by side in the same directory:
-
-- the docs_path cache (save_index/load_index): a rebuildable cache of the
-  markdown corpus, keyed by a content hash. Losing it costs a re-embed.
-- the ingested store (save_ingested/load_ingested): the running record of
-  every page brought in through /api/v1/ingest. This is the only copy of
-  that data, which is why the two stores handle corruption differently
-  (see _read_json).
-
-Every write goes through _atomic_write: content lands in a temp file in the
-same directory and is then os.replace()d over the target, so a crash or a
-restart mid-write leaves the previous good file in place instead of a
-truncated one that would poison the next startup.
+The docs cache is rebuildable so corruption degrades to a miss; the ingested
+store is the only copy, so corruption raises. See docs/design/storage.md.
 """
 import json
 import logging
@@ -26,8 +15,8 @@ from .config import load_config
 
 logger = logging.getLogger(__name__)
 
-# Module-level so deployments can point it at a mounted volume via
-# SCOUT_INDEX_DIR, and so tests can redirect it (see tests/conftest.py).
+# Module-level so SCOUT_INDEX_DIR can point it at a volume and tests can
+# redirect it (see tests/conftest.py).
 INDEX_DIR = load_config()["index_dir"]
 
 
@@ -45,13 +34,19 @@ def _paths(index_dir):
     }
 
 
+def resolve_index_dir(index_dir=None):
+    """Fall back to the module global rather than binding it at import time,
+    so monkeypatching INDEX_DIR redirects scout.store too."""
+    return index_dir or INDEX_DIR
+
+
 def _resolve(index_dir):
-    """Fall back to the module global so monkeypatching INDEX_DIR keeps
-    working, rather than binding the default at import time."""
-    return _paths(index_dir or INDEX_DIR)
+    return _paths(resolve_index_dir(index_dir))
 
 
 def _atomic_write(path, write_fn, binary=False):
+    """Write via a temp file plus os.replace, so a crash mid-write leaves the
+    previous good file rather than a truncated one."""
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, exist_ok=True)
     mode = "wb" if binary else "w"
@@ -64,33 +59,42 @@ def _atomic_write(path, write_fn, binary=False):
             os.fsync(f.fileno())
         os.replace(tmp_path, path)
     except BaseException:
-        # Leaving a stray .tmp behind would be harmless but untidy, and on a
-        # mounted volume it accumulates.
+        # A stray .tmp is harmless but accumulates on a mounted volume.
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
         raise
 
 
-def _write_npy(path, array):
-    # np.save() appends ".npy" when handed a path but not when handed a file
-    # object, which is what keeps the temp file's real name intact.
+def write_npy(path, array):
+    # np.save() appends ".npy" to a path but not to a file object, which is
+    # what keeps the temp file's real name intact.
     _atomic_write(path, lambda f: np.save(f, array), binary=True)
 
 
-def _write_json(path, obj):
-    _atomic_write(path, lambda f: json.dump(obj, f, indent=2))
+def read_npy(path):
+    """Load a .npy, raising IndexCorruptError rather than numpy's own errors
+    so callers have one exception type to catch."""
+    try:
+        return np.load(path)
+    except (ValueError, OSError) as e:
+        raise IndexCorruptError(f"could not read '{path}': {e}") from e
 
 
-def _read_json(path, recoverable):
-    """Read a JSON store, treating corruption differently per store.
+def write_json(path, obj, indent=2):
+    """Write `obj` as JSON, atomically.
 
-    `recoverable` says whether the caller can rebuild what's in this file.
-    The docs cache can (worst case a re-embed), so corruption there
-    degrades to a cache miss. The ingested store can't -- it's the only
-    copy of every page ever ingested -- so corruption there raises instead
-    of quietly starting up empty and letting the next ingest overwrite
-    still-recoverable data.
+    indent=None writes the compact form, for a machine-only file rewritten
+    on a hot path: indentation roughly triples the bytes that get fsynced.
     """
+    separators = None if indent else (",", ":")
+    _atomic_write(
+        path, lambda f: json.dump(obj, f, indent=indent, separators=separators)
+    )
+
+
+def read_json(path, recoverable):
+    """Read a JSON store. `recoverable` says whether the caller can rebuild
+    it: if not, corruption raises rather than reading as empty."""
     try:
         with open(path, encoding="utf-8") as f:
             return json.load(f)
@@ -107,10 +111,8 @@ def _read_json(path, recoverable):
 def compute_corpus_hash(docs):
     """Fingerprint the corpus so a cached index can be invalidated.
 
-    Covers source as well as content: two documents swapping filenames
-    leaves the concatenated content identical, and hashing content alone
-    would serve a cached index that attributes every chunk to the wrong
-    source.
+    Covers source as well as content: two docs swapping filenames leaves the
+    concatenated content identical.
     """
     h = hashlib.sha256()
     for d in docs:
@@ -122,18 +124,17 @@ def compute_corpus_hash(docs):
 
 
 def save_index(embeddings, metadata, corpus_hash, index_dir=None):
-    """Persist the docs_path corpus: a cache keyed by a content hash, so
-    scout-ingest can skip rebuilding embeddings when nothing changed."""
+    """Persist the docs_path corpus cache, keyed by a content hash."""
     paths = _resolve(index_dir)
-    _write_npy(paths["emb"], embeddings)
-    _write_json(paths["meta"], metadata)
+    write_npy(paths["emb"], embeddings)
+    write_json(paths["meta"], metadata)
     _atomic_write(paths["hash"], lambda f: f.write(corpus_hash))
 
 
 def load_index(index_dir=None):
     """Return (embeddings, metadata, corpus_hash), or None on a cache miss.
 
-    An unreadable or half-written cache counts as a miss: the caller just
+    An unreadable or half-written cache counts as a miss: the caller
     re-embeds.
     """
     paths = _resolve(index_dir)
@@ -141,7 +142,7 @@ def load_index(index_dir=None):
     if not all(os.path.exists(p) for p in required):
         return None
 
-    metadata = _read_json(paths["meta"], recoverable=True)
+    metadata = read_json(paths["meta"], recoverable=True)
     if metadata is None:
         return None
     try:
@@ -155,31 +156,17 @@ def load_index(index_dir=None):
 
 
 def save_ingested(embeddings, metadata, index_dir=None):
-    """Persist pages brought in through /api/v1/ingest.
-
-    Unlike save_index, this isn't a hash-invalidated cache of a fixed
-    source folder: it's the running record of everything ever ingested, so
-    it survives a process restart (see ROADMAP.md Phase 2 for the real
-    vector store this is standing in for).
-    """
+    """Write the whole-store ingested format, used by JsonChunkStore."""
     paths = _resolve(index_dir)
-    _write_npy(paths["ingested_emb"], embeddings)
-    _write_json(paths["ingested_meta"], metadata)
+    write_npy(paths["ingested_emb"], embeddings)
+    write_json(paths["ingested_meta"], metadata)
 
 
 def _load_ingested_embeddings(path, expected_rows):
-    """Read the ingested embedding matrix and check it still lines up with
-    the metadata it was written beside.
-
-    Embeddings and chunks are parallel arrays; a store where they've
-    drifted apart would keep working and silently attribute every score to
-    the wrong chunk, which is worse than refusing to load.
-    """
-    try:
-        embeddings = np.load(path)
-    except (ValueError, OSError) as e:
-        raise IndexCorruptError(f"could not read '{path}': {e}") from e
-
+    """Read the ingested matrix, refusing it if it no longer lines up with
+    its metadata -- a drifted store scores every chunk against the wrong
+    vector instead of failing."""
+    embeddings = read_npy(path)
     if len(embeddings) != expected_rows:
         raise IndexCorruptError(
             f"ingested store is inconsistent: {len(embeddings)} embeddings "
@@ -189,17 +176,16 @@ def _load_ingested_embeddings(path, expected_rows):
 
 
 def load_ingested(index_dir=None):
-    """Return (embeddings, metadata) for the ingested store, or None when
-    nothing has been ingested yet.
+    """Return (embeddings, metadata) for the whole-store format, or None.
 
-    Raises IndexCorruptError if the store exists but can't be read: it holds
-    the only copy of ingested pages, so failing loudly beats starting empty.
+    Raises IndexCorruptError if it exists but can't be read: it holds the
+    only copy of ingested pages, so failing loudly beats starting empty.
     """
     paths = _resolve(index_dir)
     if not (os.path.exists(paths["ingested_emb"]) and os.path.exists(paths["ingested_meta"])):
         return None
 
-    metadata = _read_json(paths["ingested_meta"], recoverable=False)
+    metadata = read_json(paths["ingested_meta"], recoverable=False)
     if not metadata:
         return None
     return _load_ingested_embeddings(paths["ingested_emb"], len(metadata)), metadata

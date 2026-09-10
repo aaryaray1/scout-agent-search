@@ -41,9 +41,7 @@ def test_search_keyword_score_ranks_exact_term_match_highest():
     }])
     results = retriever.search("zorbnificator", top_k=1)
     assert results[0]["source"] == "kw-test"
-    # This chunk is the only one in the corpus that could possibly match,
-    # so after min-max normalization across the corpus it should land
-    # exactly at 1.0.
+    # The only possible match, so min-max normalization lands it at 1.0.
     assert results[0]["metadata"]["keyword_score"] == 1.0
 
 
@@ -61,9 +59,7 @@ def test_add_chunks_keeps_embeddings_in_sync():
     retriever.add_chunks([new_chunk])
 
     assert len(retriever.corpus) == before + 1
-    # corpus_embeddings is a parallel array to self.corpus; add_chunks()
-    # must keep both in lockstep or search() zips them against the wrong
-    # documents.
+    # Parallel arrays: out of lockstep, search() zips the wrong documents.
     assert retriever.corpus_embeddings.shape[0] == len(retriever.corpus)
 
     results = retriever.search("widget frobnication error 9001", top_k=1)
@@ -90,6 +86,36 @@ def test_ingested_content_survives_a_new_retriever_instance():
     assert len(second.corpus) == before + 1
     results = second.search("widget frobnication error 4242", top_k=1)
     assert results[0]["source"] == "https://example.com/persisted"
+
+
+def test_a_pre_segment_store_is_still_searchable_after_an_upgrade():
+    """The upgrade path a real deployment hits. Covered at the store level in
+    tests/test_store.py; covered here because it is the retriever that has to
+    come up holding the pages, and starting empty would let the next ingest
+    supersede the only copy of them."""
+    import numpy as np
+
+    from scout.embeddings import EmbeddingModel
+    from scout.index import save_ingested
+
+    content = "Legacy quernstone bearings fail under fault code Q-8812."
+    chunk = {
+        "id": "legacy-1",
+        "content": content,
+        "source": "https://example.com/legacy",
+        "type": "web",
+        "order": 0,
+    }
+    embeddings = np.asarray(EmbeddingModel().encode([content]))
+    save_ingested(embeddings, [chunk])
+
+    retriever = Retriever()
+
+    results = retriever.search("quernstone bearing fault", top_k=1)
+    assert results[0]["source"] == "https://example.com/legacy"
+    # A second start does not double-count the page. Whether the import was
+    # written durably is asserted at the store level, in tests/test_store.py.
+    assert len(Retriever().corpus) == len(retriever.corpus)
 
 
 def test_re_ingesting_same_source_replaces_instead_of_duplicating():
@@ -258,12 +284,9 @@ def test_search_many_validates_top_k_once_for_the_batch():
 
 
 # -- keyword index alignment -------------------------------------------------
-#
-# self._bm25 addresses chunks by slot, and removals leave tombstones behind
-# rather than shifting slots, so self._bm25_slots is what keeps BM25 scores
-# attached to the chunk they were computed for. Getting that mapping wrong
-# does not raise: it silently attributes every keyword score to the wrong
-# document, which is the failure these cover.
+# _bm25_slots is what keeps a keyword score attached to the chunk it was
+# computed for. Getting it wrong does not raise, it silently scores the wrong
+# document. See docs/design/retrieval.md on slots.
 
 
 def _page(source, term, count=1):
@@ -287,9 +310,8 @@ def test_keyword_scores_stay_attached_to_their_chunk_after_a_replacement():
     for source, term in [("s://a", "quernstone"), ("s://b", "bandersnatch"), ("s://c", "flimflammery")]:
         retriever.add_chunks(_page(source, term))
 
-    # Replace the middle source, which tombstones a slot in the middle of
-    # the ingested layer: an off-by-one in the mapping shows up here and
-    # not when only the last source is replaced.
+    # Tombstoning a slot in the middle: an off-by-one shows up here and not
+    # when only the last source is replaced.
     retriever.add_chunks(_page("s://b", "wobblegong"))
 
     for term, expected in [
@@ -338,12 +360,9 @@ def test_slot_mapping_stays_the_same_length_as_the_corpus():
 
 
 # -- failure part way through an ingest --------------------------------------
-#
-# add_chunks() touches the keyword index, two parallel lists, an embedding
-# matrix and a file. A failure in the middle used to be able to leave those
-# disagreeing with each other, which does not raise at the time: it surfaces
-# later as every search failing, or as a page that serves results until the
-# next restart and then silently disappears.
+# A failure mid-add_chunks used to leave its five structures disagreeing,
+# which surfaces later as every search raising, or as a page that serves
+# results until the next restart and then disappears.
 
 
 def test_a_failed_write_leaves_the_page_unsearchable(monkeypatch):
@@ -351,15 +370,13 @@ def test_a_failed_write_leaves_the_page_unsearchable(monkeypatch):
     an error, and the page must not be live in memory: it would answer
     queries until the next restart and then vanish with nothing having
     reported a problem."""
-    import scout.search as search_module
-
     retriever = Retriever()
     before = len(retriever.corpus)
 
     def failing_write(*args, **kwargs):
         raise OSError("no space left on device")
 
-    monkeypatch.setattr(search_module, "save_ingested", failing_write)
+    monkeypatch.setattr(retriever.store, "upsert", failing_write)
     with pytest.raises(OSError):
         retriever.add_chunks(_page("s://unwritable", "sesquipedalian"))
 

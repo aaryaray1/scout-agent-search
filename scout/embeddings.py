@@ -13,10 +13,8 @@ _cache_lock = threading.Lock()
 def _get_cached_model(model_name):
     """Load `model_name` once per process and reuse it after that.
 
-    SentenceTransformer(model_name) reads weights off disk (or downloads
-    them) every time it's called. Nothing about the model changes between
-    Retriever instances, so without this every new Retriever(), including
-    one per test in the test suite, paid that load cost again.
+    SentenceTransformer() re-reads weights off disk on every call, and
+    nothing about the model changes between Retriever instances.
     """
     if model_name not in _model_cache:
         with _cache_lock:
@@ -32,12 +30,8 @@ class EmbeddingModel:
 
     @property
     def dimension(self):
-        """Width of the vectors this model produces.
-
-        Needed to size an empty embedding matrix when there is nothing to
-        embed yet, which is the normal state for an ingest-only deployment
-        starting with no local markdown corpus.
-        """
+        """Vector width, needed to size an empty matrix when there is
+        nothing to embed yet."""
         return self.model.get_sentence_embedding_dimension()
 
     def encode(self, texts):

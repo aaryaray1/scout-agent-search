@@ -150,8 +150,33 @@ Items 1 and 2 landed on 2026-09-10. Same benchmark, same machine:
 | 20,000 | 1.97ms (was 3,441ms) | 3.3ms (was 39.4ms) |
 
 The keyword half of an ingest is now flat in the size of the corpus, which
-was the point. What remains per ingest is the 238ms store rewrite, which is
-item 3.
+was the point. What remained per ingest was the 238ms store rewrite.
+
+Items 3 and 4 landed the same day. `scout/store/segmented.py` replaced the
+full rewrite with append-only segments plus a manifest, and `Retriever` now
+reaches the ingested store only through the `ChunkStore` interface. Same
+benchmark, one run, comparing the two backends through the same call:
+
+| chunks | full rewrite | segmented |
+| --- | --- | --- |
+| 1,000 | 22ms | 3.9ms |
+| 5,000 | 62ms | 3.9ms |
+| 20,000 | 725ms | 21ms |
+
+Two things worth recording about that result. The segmented write is flat in
+chunks but linear in *distinct live sources*, because the manifest carries one
+entry per source and is rewritten every ingest; the 20k row holds 2,500
+sources. Halving the manifest (an upsert supersedes exactly the sources it
+carries, so it stores no separate list) and encoding it compactly took that
+column from 21ms to where it is, and the residual slope is recorded in
+`ROADMAP.md` as the number to watch.
+
+And the absolute figures in this table are not comparable to the ones above:
+the machine was busier, and the vector column, which no Scout code touches,
+ran roughly 2x its earlier value in the same run. The full-rewrite column is
+the control here, which is the reason both backends are measured through the
+same `ChunkStore.upsert` call rather than one being quoted from an earlier
+session.
 
 Absolute figures depend on machine state more than is comfortable: the same
 script on a busy desktop reports every column, including ones no Scout code

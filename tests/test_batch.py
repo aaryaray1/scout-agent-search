@@ -1,9 +1,7 @@
 """Batch search and batch ingest.
 
-The point of these endpoints is fan-out for agents, so the tests care
-about the two properties that make them worth having over a client-side
-loop: a consistent corpus snapshot across a batch of queries, and
-per-item failure isolation across a batch of pages.
+Aimed at the two properties that make these worth having over a client-side
+loop: one corpus snapshot per batch, and per-item failure isolation.
 """
 import pytest
 from fastapi.testclient import TestClient

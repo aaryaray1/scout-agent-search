@@ -1,18 +1,7 @@
 """Python client for a running Scout server.
 
-The point of Scout is that an agent doesn't have to write the glue
-between "I have a URL" and "I have structured evidence". A framework
-hand-rolling `httpx.post(...)` against these endpoints has to rediscover
-the auth header, the error shape and the batch payloads every time, so
-that glue lives here once.
-
-Responses come back as plain dicts rather than the Pydantic models in
-scout/models.py, deliberately. Parsing into the server's own models would
-mean a client one version behind the server rejects a response carrying a
-field it hasn't heard of yet -- exactly the coupling `schema_version` is
-supposed to let callers manage themselves. The version is checked, not
-enforced: a mismatched major version warns, because the caller is in a
-better position than this module to decide whether it can still work.
+Returns plain dicts, not the server's models, so a client one version behind
+doesn't reject an unfamiliar field. See docs/design/api.md.
 """
 import logging
 
@@ -24,9 +13,8 @@ from .models import EVIDENCE_SCHEMA_VERSION
 logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8000"
-# Ingest can spend a full outbound fetch timeout (10s) plus extraction and
-# embedding before it answers, so the client's patience is set well above
-# the server's own fetch timeout rather than at the usual few seconds.
+# An ingest can spend the server's 10s fetch timeout plus extraction plus
+# embedding before it answers, so patience is set well above that.
 DEFAULT_TIMEOUT = 60.0
 
 
@@ -37,10 +25,8 @@ class ScoutError(Exception):
 class ScoutAPIError(ScoutError):
     """The server answered, and said no.
 
-    `status_code` and `detail` are pulled apart rather than flattened into
-    a message so a caller can branch on them: 401 means fix your key, 429
-    means back off (see `retry_after`), 502 means the page was
-    unreachable and retrying may well work.
+    status_code, detail and retry_after are kept apart so a caller can
+    branch: 401 fix your key, 429 back off, 502 the page was unreachable.
     """
 
     def __init__(self, status_code, detail, retry_after=None):
@@ -53,9 +39,8 @@ class ScoutAPIError(ScoutError):
 def _detail_of(response):
     """Pull FastAPI's `detail` out of an error body, falling back to text.
 
-    A non-JSON body means something other than Scout answered -- a proxy,
-    a load balancer, an error page -- which is worth surfacing verbatim
-    instead of hiding behind a parse failure.
+    A non-JSON body means something other than Scout answered -- a proxy, a
+    load balancer -- which is worth surfacing verbatim.
     """
     try:
         body = response.json()
@@ -89,14 +74,10 @@ class ScoutClient:
         timeout=DEFAULT_TIMEOUT,
         client=None,
     ):
-        """`client` accepts a pre-built httpx.Client.
-
-        That's what makes this testable without a live server (an
-        ASGITransport pointed at the app), and it's also the hook a caller
-        needs for a proxy, a custom retry transport or mTLS. A client
-        passed in is not closed by this one, on the principle that
-        whoever opened it owns it.
-        """
+        """`client` accepts a pre-built httpx.Client: the hook for a proxy,
+        a retry transport or mTLS, and what makes this testable against the
+        ASGI app. One passed in is not closed here -- whoever opened it owns
+        it."""
         self.base_url = base_url.rstrip("/")
         headers = {API_KEY_HEADER: api_key} if api_key else {}
         self._owns_client = client is None
@@ -118,8 +99,8 @@ class ScoutClient:
     def _check_schema_version(self, body):
         """Warn when the server's evidence schema has moved on.
 
-        Compares major versions only: "1.1" adding a field is something a
-        tolerant caller survives, "2.0" reshaping evidence is not.
+        Major versions only: "1.1" adding a field is survivable, "2.0"
+        reshaping evidence is not.
         """
         served = str(body.get("schema_version", ""))
         if served and served.split(".")[0] != EVIDENCE_SCHEMA_VERSION.split(".")[0]:
@@ -170,8 +151,7 @@ class ScoutClient:
         return self._request("POST", "/api/v1/ingest", json={"url": url})
 
     def ingest_html(self, html, source_url):
-        """Structure HTML the caller already has (from its own browser
-        session, say), attributed to `source_url`."""
+        """Structure HTML the caller already has, attributed to source_url."""
         return self._request(
             "POST", "/api/v1/ingest", json={"html": html, "source_url": source_url}
         )
@@ -179,10 +159,8 @@ class ScoutClient:
     def ingest_batch(self, items):
         """Ingest several pages in one call.
 
-        `items` are dicts in /ingest's own shape: {"url": ...} or
-        {"html": ..., "source_url": ...}. Returns one result per item, in
-        order, each with its own `status` -- a page that failed doesn't
-        raise, because the others succeeded.
+        `items` take /ingest's own shape. Returns one result per item, in
+        order, each with its own status -- a failed page doesn't raise.
         """
         body = self._request(
             "POST", "/api/v1/ingest/batch", json={"items": list(items)}

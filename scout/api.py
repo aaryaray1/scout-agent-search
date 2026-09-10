@@ -1,15 +1,7 @@
 """FastAPI surface: /api/v1 search and ingest, single and batch.
 
-Both endpoints are deliberately `def`, not `async def`. Retrieval is
-CPU-bound (embedding a query, scoring the corpus) and ingest does a
-blocking outbound fetch; declaring them sync lets Starlette run them in
-its threadpool instead of stalling the event loop. Retriever is built for
-exactly that concurrency -- see its docstring on the two locks.
-
-Every /api/v1 route sits behind require_api_key (scout/auth.py). `/` and
-/health deliberately don't: a liveness probe shouldn't need a credential,
-and neither one reveals anything a caller couldn't learn from the port
-answering at all.
+Endpoints are `def`, not `async def`, so Starlette runs them in its
+threadpool rather than stalling the event loop. See docs/design/api.md.
 """
 import logging
 import math
@@ -38,22 +30,15 @@ from .web import ingest_html, ingest_url
 
 logger = logging.getLogger(__name__)
 
-# Documented on the ingest routes so an agent can read the failure mode
-# out of /openapi.json instead of discovering it under load.
+# Documented on the ingest routes so an agent reads the failure mode out of
+# /openapi.json instead of discovering it under load.
 RATE_LIMITED = {429: {"description": "Per-caller ingest rate limit exceeded."}}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Build the per-process state on startup rather than at import time.
-
-    Constructing it eagerly at module scope (the old approach) meant
-    merely importing this module -- which any test file does -- loaded
-    the embedding model and touched disk. Building it here instead means
-    it only happens when the app actually starts, which is also the
-    point at which test isolation (see tests/conftest.py) can redirect
-    where it reads/writes.
-    """
+    """Build per-process state on startup rather than at import time, so
+    importing this module doesn't load the embedding model or touch disk."""
     config = load_config()
     configure_logging(config["log_level"])
     app.state.auth = ApiKeyAuth(config["api_keys"])
@@ -81,11 +66,8 @@ def get_retriever(request: Request) -> Retriever:
 def charge_ingest(request: Request, caller: str, cost: int = 1) -> None:
     """Spend `cost` against the caller's ingest budget, or raise 429.
 
-    Called explicitly rather than declared as a dependency because the
-    cost of a batch is the number of items in its body, which a
-    dependency can't see. Charging a batch its full length is the point:
-    otherwise /ingest/batch would be a way to make N outbound fetches for
-    the price of one.
+    Called explicitly rather than as a dependency because a batch costs its
+    own length, which a dependency cannot see.
     """
     retry_after = request.app.state.limiter.check(caller, cost)
     if retry_after is None:
@@ -94,8 +76,8 @@ def charge_ingest(request: Request, caller: str, cost: int = 1) -> None:
     raise HTTPException(
         status_code=429,
         detail=f"ingest rate limit exceeded; retry in {retry_after}s",
-        # Retry-After is defined in whole seconds; round up so a client
-        # obeying it exactly doesn't come back a fraction too early.
+        # Retry-After is whole seconds; round up so a client obeying it
+        # exactly doesn't come back a fraction too early.
         headers={"Retry-After": str(math.ceil(retry_after))},
     )
 
@@ -113,11 +95,10 @@ def root():
 
 @app.get("/health")
 def health(request: Request, retriever: Retriever = Depends(get_retriever)):
-    """Liveness plus enough state to tell an empty deployment from a
-    populated one, and an open one from a guarded one.
+    """Liveness, corpus size, and whether auth is on.
 
-    `auth` is reported because "did my API keys actually reach the
-    container" is otherwise only answerable by getting rejected.
+    Open, like `/`: a probe shouldn't need a credential, and neither reveals
+    anything the port answering at all doesn't.
     """
     return {
         "status": "ok",
@@ -137,8 +118,7 @@ def search_endpoint(
 ):
     """Retrieve the best-matching evidence for a query.
 
-    Empty and oversized queries are rejected by SearchRequest itself, so
-    there is nothing left to validate here.
+    Empty and oversized queries are rejected by the request model itself.
     """
     results = retriever.search(q.query, top_k=q.top_k)
     return {"query": q.query, "results": results}
@@ -150,14 +130,9 @@ def search_batch_endpoint(
     retriever: Retriever = Depends(get_retriever),
     caller: str = Depends(require_api_key),
 ):
-    """Answer several queries in one round trip.
-
-    For an agent fanning out over sub-questions this is one HTTP call
-    instead of N, and every query is scored against the same corpus
-    snapshot, so results within a batch stay mutually consistent even if
-    an ingest lands while it runs. Not rate limited: like /search it's
-    local CPU work, already bounded by the batch-length cap.
-    """
+    """Answer several queries in one round trip, against one corpus
+    snapshot, so results stay mutually consistent if an ingest lands
+    mid-batch. Not rate limited: local CPU work, already batch-capped."""
     batches = retriever.search_many(q.queries, top_k=q.top_k)
     return {
         "results": [
@@ -170,7 +145,7 @@ def search_batch_endpoint(
 # -- ingest ------------------------------------------------------------------
 
 def _extract_page(req: IngestRequest):
-    """Run the right ingest path for the request and return
+    """Run the right ingest path and return
     (source_url, title, metadata, chunks)."""
     if req.url:
         title, metadata, chunks = ingest_url(req.url)
@@ -200,23 +175,20 @@ def ingest_endpoint(
     retriever: Retriever = Depends(get_retriever),
     caller: str = Depends(require_api_key),
 ):
-    """Convert a web page (fetched by URL, or handed to us as raw HTML)
-    straight into structured JSON: the conversion step agents otherwise
-    have to do themselves. Also indexes the result so it's immediately
-    searchable via /api/v1/search, and persists it so it survives a
-    restart (see scout/index.py; still not the real Phase 2 vector
-    store).
+    """Turn a web page into structured JSON, index it, and persist it.
+
+    Takes a URL for Scout to fetch, or raw HTML the caller already has. The
+    result is searchable immediately, with no rebuild step.
     """
     charge_ingest(request, caller)
     try:
         source_url, title, metadata, chunks = _extract_page(req)
     except FetchError as e:
-        # Upstream wouldn't give us the page: that's a bad gateway, not a
-        # bad request.
+        # Upstream wouldn't give us the page: a bad gateway, not a bad request.
         logger.warning("ingest fetch failed: %s", e)
         raise HTTPException(status_code=502, detail=str(e)) from e
     except ValueError as e:
-        # Nothing extractable in the HTML: the caller's input is the problem.
+        # Nothing extractable: the caller's input is the problem.
         logger.info("ingest extraction rejected: %s", e)
         raise HTTPException(status_code=422, detail=str(e)) from e
 
@@ -225,13 +197,8 @@ def ingest_endpoint(
 
 
 def _ingest_one(req: IngestRequest):
-    """Ingest one batch item. Returns (result, chunks), and never raises
-    for a per-item failure.
-
-    The two exception types the single-page endpoint turns into 502 and
-    422 become status strings here, since one bad page shouldn't decide
-    the status of the whole batch.
-    """
+    """Ingest one batch item as (result, chunks), never raising for a
+    per-item failure: the 502/422 split becomes a status string instead."""
     requested_url = req.url or req.source_url
     try:
         source_url, title, metadata, chunks = _extract_page(req)
@@ -256,25 +223,15 @@ def ingest_batch_endpoint(
 ):
     """Ingest several pages in one call, indexing them as a single write.
 
-    Two things this does that a client looping over /ingest can't:
-
-    - A failed page fails alone. Results come back in request order, each
-      carrying its own status, so an agent crawling ten links gets the
-      eight that worked instead of one error.
-    - Every chunk goes in through one add_chunks() call, so the ingested
-      store and the BM25 index are rewritten once for the batch instead
-      of once per page (ROADMAP.md Phase 2 on why that rewrite is the
-      expensive part).
-
-    Costs the rate limiter one unit per item, since that's how many
-    outbound fetches it can trigger.
+    A failed page fails alone, with its own status, so an agent crawling ten
+    links gets the eight that worked. Costs the rate limiter one unit per
+    item, since that is how many outbound fetches it can trigger.
     """
     charge_ingest(request, caller, cost=len(req.items))
 
     results = []
     # Keyed by source so a URL repeated inside one batch is indexed once,
-    # matching add_chunks()'s own "one version per source" rule. Every
-    # item still gets its own entry in the response.
+    # matching add_chunks()'s own one-version-per-source rule.
     chunks_by_source = {}
     for item in req.items:
         result, chunks = _ingest_one(item)

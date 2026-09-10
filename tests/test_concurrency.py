@@ -1,25 +1,11 @@
-"""Concurrency guarantees for the Retriever.
+"""Concurrency guarantees for the Retriever: a search landing mid-ingest
+must never see the corpus, the embeddings and the keyword index disagree.
 
-FastAPI runs Scout's sync endpoints in a threadpool, so a /api/v1/search
-can land in the middle of a /api/v1/ingest. self.corpus,
-self.corpus_embeddings and self._bm25 are three parallel structures that
-have to be swapped as a group: a search that saw a new corpus against
-stale embeddings would score chunks against the wrong vectors and return
-confident nonsense, and one that caught the BM25 index mid-rebuild would
-read a term table that no longer matches its document count.
-
-These tests hammer that window rather than asserting on the locks
-themselves, so they keep their meaning if the implementation changes. Both
-were checked against a deliberately broken Retriever and both fail on it:
-the first on an unsynchronized corpus swap, the second on an unsynchronized
-ingest. An earlier third test asserted the same invariant by polling
-_snapshot() directly and was dropped -- the window between two adjacent
-attribute assignments is too narrow to sample, so it passed against the
-broken version and would only have bought false confidence.
-
-Worker loops are bounded rather than run-until-stopped: an unbounded
-searcher re-embeds its query every pass, turning a second of contention
-into minutes of test time for no extra coverage.
+These hammer that window rather than asserting on the locks, so they keep
+their meaning if the implementation changes; both fail against a
+deliberately unsynchronized Retriever. Worker loops are bounded because an
+unbounded searcher re-embeds its query every pass.
+See docs/design/retrieval.md.
 """
 import threading
 

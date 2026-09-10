@@ -1,46 +1,8 @@
-"""BM25 keyword relevance scoring over an incremental inverted index.
+"""Okapi BM25 over an incremental inverted index (term -> {slot: tf}).
 
-Replaces the token-overlap scoring scout/keyword.py used to provide (raw
-set intersection: no notion of how rare a term is across the corpus, or
-how many times it appears in a given document) with real Okapi BM25:
-term-frequency weighted, and normalized against corpus-wide term rarity
-and document length.
-
-Implemented directly rather than pulling in a search library like whoosh
-(the dependency ROADMAP.md originally floated for this): the formula
-itself is compact, this way there's no dependency of uncertain modern
-Python support, and every step of it is under test below.
-
-**Why an inverted index rather than the per-document scan this started
-as.** The first version stored one Counter per document and, on every
-query, looped over every document in the corpus. Worse, it had no way to
-add or remove a document, so Retriever rebuilt the whole index -
-re-tokenizing every chunk - on every single ingest. Measured at 20k
-chunks that rebuild cost 3.4 seconds per ingest, against 11ms for the
-vector scan the roadmap had proposed replacing instead. See
-docs/architecture/adr-001-incremental-index.md.
-
-The index is therefore keyed the other way round, `term -> {slot: tf}`,
-which makes three things cheap that were not:
-
-- adding documents costs the terms in those documents, not the corpus
-- removing them costs the same, since a slot can be popped out of each of
-  its terms' posting lists directly
-- scoring touches only documents that contain a query term, instead of
-  every document
-
-**Slots.** A document's position in this index is called a slot and never
-changes while it is live, because postings hold slot numbers. Removing a
-document leaves its slot behind as a tombstone: `scores()` still returns
-an entry for it (always 0.0) so the returned list stays aligned with the
-caller's own view. compact() reclaims tombstoned slots by renumbering,
-which is the only operation that invalidates slot numbers, and it does so
-without re-tokenizing anything.
-
-**Thread safety: none, by design.** This index is mutated in place, so a
-reader iterating a posting list while a writer inserts into it would
-raise RuntimeError. Callers serialize access; see Retriever's class
-docstring for why a lock is affordable here and copy-on-write is not.
+Documents are addressed by slot, which survives removal. Not thread-safe by
+design: it is mutated in place and callers serialize. See
+docs/design/retrieval.md.
 """
 import math
 import re
@@ -48,9 +10,8 @@ from collections import Counter
 
 import numpy as np
 
-K1 = 1.5  # term-frequency saturation: higher values let repeated terms
-B = 0.75  # keep adding weight for longer before diminishing returns
-          # document-length normalization: 0 = ignore length, 1 = full
+K1 = 1.5  # term-frequency saturation
+B = 0.75  # document-length normalization: 0 = ignore length, 1 = full
 
 _WORD_RE = re.compile(r"\w+")
 
@@ -61,12 +22,10 @@ def term_counts(text):
 
 
 class BM25Index:
-    """BM25 relevance scoring over a list of corpus chunk dicts.
+    """BM25 scoring over a list of corpus chunk dicts.
 
-    Documents are addressed by slot (see the module docstring). Slots are
-    handed out in insertion order, so an index that has never had anything
-    removed has slot == position, which is what lets a caller that only
-    ever appends ignore slots entirely.
+    Slots are handed out in insertion order, so an index that has never had
+    anything removed has slot == position.
     """
 
     def __init__(self, corpus=None):
@@ -85,13 +44,11 @@ class BM25Index:
 
     @property
     def size(self):
-        """Number of slots, live and tombstoned. This is the length of the
-        list scores() returns."""
+        """Slots, live and tombstoned. The length of what scores() returns."""
         return len(self._doc_terms)
 
     @property
     def live_docs(self):
-        """Number of documents actually in the index."""
         return self._live_docs
 
     @property
@@ -100,8 +57,8 @@ class BM25Index:
 
     @property
     def _avg_doc_length(self):
-        """Derived rather than stored: it moves on every add and remove, and
-        a stale copy would silently skew every length normalization."""
+        # Derived, not stored: it moves on every add and remove, and a stale
+        # copy would skew every length normalization.
         return self._total_length / self._live_docs if self._live_docs else 0.0
 
     # -- mutation ------------------------------------------------------------
@@ -112,10 +69,9 @@ class BM25Index:
         self.add_documents(corpus)
 
     def add_documents(self, docs):
-        """Index `docs`, returning the slots assigned to them in order.
+        """Index `docs`, returning their assigned slots in order.
 
-        Costs the terms in `docs`, not the size of the corpus, which is the
-        whole reason this method exists.
+        Costs the terms in `docs`, not the size of the corpus.
         """
         slots = []
         postings = self._postings
@@ -127,10 +83,8 @@ class BM25Index:
             self._doc_terms.append(counts)
             self._doc_lengths.append(length)
             for term, frequency in counts.items():
-                # get-then-create rather than setdefault: setdefault
-                # evaluates its default eagerly, so it allocates a throwaway
-                # dict for every (document, term) pair even though almost
-                # all of them find an existing posting list.
+                # get-then-create, not setdefault, which would allocate a
+                # throwaway dict for every (document, term) pair.
                 bucket = postings.get(term)
                 if bucket is None:
                     bucket = postings[term] = {}
@@ -142,14 +96,8 @@ class BM25Index:
         return slots
 
     def remove_slots(self, slots):
-        """Tombstone `slots`, dropping their postings.
-
-        The slot numbers themselves are not reused, so every other
-        document's slot stays valid and the caller's mapping survives.
-        Removing an already-removed slot is a no-op rather than an error,
-        since a caller replacing two sources that share a chunk shouldn't
-        have to de-duplicate first.
-        """
+        """Tombstone `slots` and drop their postings, leaving every other
+        slot number valid. Removing an already-removed slot is a no-op."""
         for slot in slots:
             counts = self._doc_terms[slot]
             if counts is None:
@@ -159,9 +107,8 @@ class BM25Index:
                 if postings is None:
                     continue
                 postings.pop(slot, None)
-                # A term nothing contains any more would otherwise sit in
-                # the index forever inflating nothing but memory, and would
-                # make len(postings) == 0 a case _idf has to handle.
+                # An empty posting list would sit there forever and make
+                # len(postings) == 0 a case _idf has to handle.
                 if not postings:
                     del self._postings[term]
 
@@ -171,23 +118,11 @@ class BM25Index:
             self._live_docs -= 1
 
     def compacted(self):
-        """Return a new index holding only the live documents, renumbered.
+        """A new index holding only live documents, renumbered in insertion
+        order, so a caller in that same order resets its mapping to a range.
 
-        Invalidates every slot number the caller holds: in the result, live
-        documents occupy slots 0..live_docs-1 in the order they were added,
-        so a caller whose own view is in that same order can simply reset
-        its mapping to a range.
-
-        A new object rather than a mutation in place, because re-keying
-        every posting list is proportional to the whole index rather than
-        to what changed. Building it off to the side lets a caller do that
-        work without excluding readers, and swap the result in afterwards.
-
-        Cheap relative to a rebuild because the per-document term counts
-        are reused as they are; nothing is tokenized again. Those counters
-        end up shared with this index, which is safe because nothing ever
-        mutates one after it is built -- documents are replaced wholesale,
-        never edited.
+        A new object because re-keying is O(index) and the caller wants that
+        outside its read lock. Term counters are reused, not re-tokenized.
         """
         survivors = self._live_slots()
         renumbered = {old: new for new, old in enumerate(survivors)}
@@ -202,18 +137,12 @@ class BM25Index:
         return compacted
 
     def _live_slots(self):
-        """Slots still holding a document, in order."""
         return [
             slot for slot, counts in enumerate(self._doc_terms) if counts is not None
         ]
 
     def _renumbered_postings(self, renumbered):
-        """Re-key every posting list through `renumbered`.
-
-        Postings only ever hold live slots, because remove_slots pops them
-        as it goes, so every key here is guaranteed to be present in the
-        mapping.
-        """
+        # Postings only ever hold live slots, since remove_slots pops them.
         return {
             term: {renumbered[slot]: frequency for slot, frequency in postings.items()}
             for term, postings in self._postings.items()
@@ -222,21 +151,17 @@ class BM25Index:
     # -- querying ------------------------------------------------------------
 
     def _idf(self, term):
-        # Document frequency is the length of the posting list, so there is
-        # no separate counter to keep in sync with it.
+        # Document frequency is the posting list length, so there is no
+        # separate counter to keep in sync.
         n_t = len(self._postings.get(term, ()))
-        # +1 smoothed variant: keeps IDF non-negative even for a term that
-        # appears in every document, instead of going negative like the
-        # classic Robertson-Sparck Jones formula can.
+        # +1 smoothed: stays non-negative for a term in every document.
         return math.log(1 + (self._live_docs - n_t + 0.5) / (n_t + 0.5))
 
     def _accumulate(self, query_terms, avg_doc_length):
         """Sum each query term's BM25 contribution into a per-slot list.
 
-        Walks posting lists, so the cost is the number of (term, document)
-        pairs the query actually matches rather than the size of the
-        corpus. Constants are hoisted out of the inner loop because that
-        loop is the hot path for every search Scout serves.
+        Walks posting lists, so cost is the (term, document) pairs the query
+        matches. Constants are hoisted: this is the hot path for every search.
         """
         scores = [0.0] * len(self._doc_terms)
         lengths = self._doc_lengths
@@ -255,11 +180,10 @@ class BM25Index:
         return scores
 
     def scores(self, query):
-        """Return one BM25 score per slot, in slot order.
+        """One BM25 score per slot, in slot order.
 
-        0.0 for documents sharing no term with the query, and 0.0 for
-        tombstoned slots, which are kept in the output so the list stays
-        aligned with a caller's own slot mapping.
+        Tombstoned slots score 0.0 and stay in the output, so the list stays
+        aligned with a caller's slot mapping.
         """
         if not self._doc_terms:
             return []
@@ -270,35 +194,25 @@ class BM25Index:
         return self._accumulate(query_terms, avg_doc_length)
 
     def scores_array(self, query):
-        """scores() as a numpy array, for callers that fuse it with vector
-        similarities."""
+        """scores() as a numpy array, for fusing with vector similarities."""
         return np.asarray(self.scores(query), dtype=float)
 
 
 def normalize(scores):
-    """Min-max scale `scores` to [0, 1] so they're comparable to the
-    cosine similarity half of the hybrid score. Raw BM25 scores are
-    unbounded (can run well past 1 for strong, rare-term matches), so
-    fusing them in directly would swamp the vector_weight/keyword_weight
-    balance in scout/config.json.
-    """
+    """Min-max scale to [0, 1] so raw, unbounded BM25 scores are comparable
+    to cosine similarity before fusing."""
     if not scores:
         return scores
     lo, hi = min(scores), max(scores)
     if hi == lo:
-        # No discriminating signal (including the common case where every
-        # score is 0, i.e. nothing matched any query term).
+        # No discriminating signal, including the common all-zero case.
         return [0.0] * len(scores)
     return [(s - lo) / (hi - lo) for s in scores]
 
 
 def normalize_array(scores):
-    """normalize() for numpy input, without the round trip through a list.
-
-    Same scaling and the same all-equal special case; kept alongside
-    normalize() rather than replacing it so a library caller holding plain
-    lists isn't forced into numpy.
-    """
+    """normalize() for numpy input, kept alongside it so a library caller
+    holding plain lists isn't forced into numpy."""
     if scores.size == 0:
         return scores
     lo, hi = scores.min(), scores.max()

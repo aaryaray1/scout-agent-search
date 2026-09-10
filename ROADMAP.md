@@ -2,9 +2,9 @@
 
 Ordered by dependency, not strictly by priority. Phase 1 is the actual point of the project.
 
-Phases 0, 1 and 3 are done. Phase 2 is in progress. Phases 5, 6 and 7 are the finish line: hosted somewhere reachable, retrieval quality demonstrated rather than asserted, and an integration surface an agent can find on its own. Phase 4 sits behind them deliberately - being usable comes before being contributable to.
+Phases 0, 1 and 3 are done. Phase 2's storage work is done and only near-duplicate detection is left in it. Phase 7 has its headline item, the MCP server. Phases 5 and 6 are what remains of the finish line: hosted somewhere reachable, and retrieval quality demonstrated rather than asserted. Phase 4 sits behind them deliberately - being usable comes before being contributable to.
 
-Where a decision here was made against measurements rather than intuition, the measurements live in [docs/architecture/](docs/architecture/) and can be reproduced with `scripts/bench_index.py`.
+Where a decision here was made against measurements rather than intuition, the measurements live in [docs/architecture/](docs/architecture/) and can be reproduced with `scripts/bench_index.py`. How each part actually works is in [docs/design/](docs/design/).
 
 ## Phase 0 - local search prototype (done)
 
@@ -58,12 +58,12 @@ This phase was originally written as "swap the flat `numpy` array and JSON metad
 
 Open:
 
-- **The ingested store is still rewritten in full on every ingest.** 238ms at 20k chunks, growing linearly, and now the only O(everything) step left on the ingest path. The fix is an append-only segmented store: each ingest writes one new segment, replaced sources are recorded as tombstones in a manifest, and compaction merges segments once tombstones pass a threshold. Crash safety comes for free, since segments are never mutated in place. `scout/store/base.py` holds the interface this implements against, and `JsonChunkStore` there is the current behaviour wrapped in it, so the two can be tested against the same cases.
 - **The docs_path corpus still forces a full re-embed on any change.** Unchanged by the above: it is a hash-invalidated cache of a fixed folder, so a single edited markdown file re-embeds all of it.
 - Near-duplicate detection across different URLs. Exact same-URL re-ingestion is handled (Phase 1); two different URLs serving the same or near-identical content still produce separate chunks. Content hashing catches the exact case cheaply; near-duplicates need an embedding-similarity threshold at ingest time.
 - Retrieval is still a linear scan over every embedding, and deliberately so for now - 11ms at 20k chunks, in a numpy matmul that releases the GIL. This is the number that has to grow before a vector store earns its operational cost.
 - **`/api/v1/search/batch` holds the index lock for the whole batch.** Keyword scoring for every query in a batch happens in one locked section, so hold time scales with batch length (up to `max_batch_queries`, default 10) while a single search does not. That endpoint is deliberately not rate limited, since it is local CPU work, so concurrent batch callers can delay an ingest more than a single search would. Scoring per query would shorten the hold but would give up the guarantee that every query in a batch sees one corpus snapshot, which is why the endpoint exists; the real fix is a reader-writer lock, and it belongs with the Phase 5 hosting work where concurrency actually gets exercised.
-- **Building the keyword index cold is now more expensive, not less.** An inverted index writes one entry per (document, term) pair into thousands of posting lists where the old structure incremented one flat counter. That is a deliberate trade - it is paid once at startup instead of on every ingest - but it means a 20k-chunk ingested corpus spends about 3.4s on startup rebuilding the keyword index. Persisting the postings alongside the segments would remove it, and belongs with the segmented store.
+- **Building the keyword index cold is now more expensive, not less.** An inverted index writes one entry per (document, term) pair into thousands of posting lists where the old structure incremented one flat counter. That is a deliberate trade - it is paid once at startup instead of on every ingest - but it means a 20k-chunk ingested corpus spends about 3.4s on startup rebuilding the keyword index. Persisting the postings alongside the segments would remove it. The segmented store landed without doing so, deliberately: postings would have to be invalidated and rewritten on every merge, and startup is the one cost a long-running service pays least often.
+- **A segmented store write is flat in chunks but linear in distinct live sources.** The manifest carries one entry per source and is rewritten on every ingest: 21ms at 20k chunks across 2,500 sources, against 725ms for the full rewrite it replaced. A far shallower slope, and small enough not to be the constraint, but not flat. It is the number to watch if the ADR-001 revisit trigger is ever approached.
 
 Closed since first written:
 
@@ -71,6 +71,12 @@ Closed since first written:
 - **Removal is by tombstone, and slots are the reason.** Dropping a document from the middle of the index would shift the position of every document after it, which would silently re-point the retriever's whole mapping at the wrong chunks. Removed documents keep their slot and score 0.0; `Retriever._bm25_slots` maps corpus position to slot, and `compact()` reclaims tombstones once they pass a threshold, renumbering without re-tokenizing anything. The tests for this were checked against five deliberately broken versions (statistics not updated on add, live count not decremented on remove, slots deleted rather than tombstoned, postings not renumbered on compact, postings not popped on remove) and each one is caught.
 - **The retriever's concurrency model changed with it.** The old design kept searches lock-free by building an entire new BM25 index off to the side and swapping it in - that swap was the thing being made cheap, and it is exactly what an incremental index cannot offer, since a search iterating a posting list while an ingest inserts into it raises `RuntimeError`. `_swap_lock` became `_index_lock` and now covers keyword scoring as well as the handover. That is affordable because of the change itself: mutation is proportional to what changed, and BM25 scoring is pure Python, which the GIL already serializes across threads. Query embedding, the numpy similarity scan and disk writes all stay outside the lock. Copy-on-write was the alternative and was rejected: copying the postings is O(total postings), which is the cost the change exists to remove.
 - **There is a benchmark, so these numbers can be re-checked rather than believed.** `scripts/bench_index.py`. It draws words from a Zipf distribution rather than uniformly, because uniform draws produce chunks with about 390 distinct terms where real prose has about 237, which inflates indexing cost and deflates query cost at the same time. An earlier uniform version of this benchmark pointed at a different conclusion.
+
+- **The ingested store appends instead of rewriting.** Every ingest used to rewrite every page ever ingested: 238ms at 20k chunks, growing linearly, and the last O(everything) step on the ingest path once the keyword index became incremental. `scout/store/segmented.py` writes one immutable segment per ingest plus a manifest entry recording which sources it supersedes, and merges the live set back into one segment once dead weight or segment count passes a threshold. Same benchmark run: 22ms/62ms/725ms for the full rewrite at 1k/5k/20k chunks, against 3.9ms/3.9ms/21ms segmented.
+
+  Crash safety comes from the write ordering rather than from a lock. Segments land first and are inert until the manifest names them, so a crash leaves either the old manifest and an unreferenced segment - cleaned up on the next load - or the new one. There is no window where a partially written store reads as a complete one. A pre-segment store is imported automatically on first start, since an upgrade that silently began empty would let the next ingest supersede the only copy of every page already there.
+
+- **`Retriever` talks to the storage interface, not to `scout.index`.** The `ChunkStore` seam was scaffolded and unused; it is now the only path to the ingested store, selected by the `chunk_store` config value. `JsonChunkStore` stays as the reference implementation and the rollback path, and `tests/test_store.py` runs the whole contract against both backends, so a case that passes on the old one and fails on the new one is a regression rather than a new expectation.
 
 - Real BM25 keyword scoring, tracked above under Phase 0 (it replaced Phase 0's token-overlap scoring, so that's where the detail lives) rather than pulling in `whoosh` as originally floated here.
 - **Writes are now crash-safe.** Both stores were written with bare `open()` calls whose handles were never closed and whose encoding defaulted to whatever the host happened to use. A crash or restart mid-write left a truncated file that the next startup would choke on. Every write now goes through a temp file, `fsync`, and an atomic `os.replace`, with UTF-8 declared explicitly. `pytest` treats `ResourceWarning` as an error, so a reintroduced leaked handle fails the suite.
@@ -125,11 +131,22 @@ Scout is fast and returns well-shaped evidence. Nothing so far shows the evidenc
 
 ## Phase 7 - agent-native integration
 
-The pitch is search built for agents. Right now an agent still has to be told about Scout's HTTP API by whoever wires it up.
+The pitch is search built for agents, and the MCP server is what makes it true without anyone wiring it up by hand.
 
-- An MCP server exposing `search` and `ingest` as tools, so any MCP-capable agent can use Scout without glue. This is the highest-leverage item on the list, since it turns the README's claim into something an agent discovers by itself.
+Open:
+
 - A LangChain / LlamaIndex retriever adapter, for frameworks that expect their own interface.
+- **Search restricted to named sources.** "What does this page say about X" is the shape an agent reaches for after ingesting, and today it can only search the whole corpus and hope the right page ranks. A `sources` filter on `search` would also make a `read(url, query)` MCP tool a few lines rather than a new subsystem.
+- **A structured-output contract shared with the HTTP API.** The MCP tools declare their response shape as pydantic models (`Passage`, `IngestedPage`), which is a second set of models alongside `scout/models.py`. They agree today because both are small; nothing enforces it.
 - **Negotiated `schema_version`.** Carried over from Phase 3: the field exists on every response and the Python client warns on a major-version mismatch, but nothing lets a caller *request* a version and there is no documented list of what changes between them. That is a check, not a contract, and shipping integrations is the point at which it starts to matter.
+
+Closed since first written:
+
+- **Scout is an MCP server.** `scout/mcp.py`, installed as `scout-mcp` from the `[mcp]` extra, exposes `search` and `ingest` to any MCP-capable agent. It runs Scout in-process by default, so an agent gets web ingestion and search with nothing to deploy, and `--url` points it at a shared Scout instead; both backends return the same shape, so the tools never branch on which is behind them.
+
+  The design decision the server turns on is that **`ingest` returns a summary, not the page**. Echoing the body back would cost exactly the tokens an agent came to save, making it `fetch` with extra steps. The response is bounded regardless of page size - title, chunk and word counts, metadata, and a 40-word preview so the agent can tell it got the page it meant - and the body comes back through `search`, a few hundred tokens at a time. `search` drops the scoring breakdown the HTTP API returns for the same reason.
+
+  Both tools publish an output schema, because they return pydantic models rather than bare dicts. An agent reading the tool listing sees the response shape rather than parsing JSON out of a text block, which is the thing Scout exists to stop agents doing. See [docs/design/mcp.md](docs/design/mcp.md).
 
 ## Security notes
 

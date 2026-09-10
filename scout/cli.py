@@ -34,8 +34,8 @@ def _index_is_current(corpus_hash):
 
 
 def build_index(path, rebuild=False):
-    """Embed every markdown chunk under `path` unless the cache already
-    matches. Returns the number of chunks in the index."""
+    """Embed every markdown chunk under `path` unless the cache matches.
+    Returns the number of chunks in the index."""
     config = load_config()
     docs = chunk_docs(load_markdown_docs(path))
     if not docs:
@@ -61,8 +61,8 @@ def main():
     config = load_config()
     configure_logging(config["log_level"], fmt=CLI_FORMAT)
     args = _build_parser(config).parse_args()
-    # A CLI that reports success on an empty corpus makes an empty index
-    # look like a working one; exit non-zero so a build step catches it.
+    # Exit non-zero on an empty corpus, so a build step catches it rather
+    # than shipping an empty index that looks like a working one.
     return 0 if build_index(args.path, rebuild=args.rebuild) else 1
 
 

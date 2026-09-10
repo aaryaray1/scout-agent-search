@@ -1,11 +1,7 @@
-"""HTTP fetching for Scout's ingest pipeline.
+"""HTTP fetching for the ingest pipeline, with SSRF and size guards.
 
-This fetches arbitrary URLs on behalf of callers, which is real attack
-surface (SSRF): a caller could ask Scout to request internal services,
-cloud metadata endpoints, etc. The guards below are a first pass, not a
-complete answer. See ROADMAP.md's "Security notes" for known gaps, notably
-DNS rebinding: the host is validated at resolution time, not at the moment
-of connection.
+Caller-chosen URLs are Scout's main attack surface; docs/design/ingestion.md
+covers what is guarded and what is not (notably DNS rebinding).
 """
 import ipaddress
 import logging
@@ -75,11 +71,8 @@ def _validate_url(url: str) -> str:
 
 
 def _assert_html_content_type(response) -> None:
-    """Reject non-HTML responses (PDFs, JSON error pages served with a 200,
-    images, etc.) before handing them to the extractor, which would
-    otherwise fail with a generic "no extractable content" error further
-    down the pipeline.
-    """
+    """Reject a PDF, an image or a JSON error page before extraction, which
+    would otherwise fail generically further down the pipeline."""
     content_type = response.headers.get("content-type", "")
     if not content_type:
         return  # some servers omit it; nothing to validate against
@@ -91,13 +84,8 @@ def _assert_html_content_type(response) -> None:
 
 
 def _build_client(timeout: float) -> httpx.Client:
-    """Construct the HTTP client used for one fetch.
-
-    Redirects are handled here rather than by httpx (follow_redirects stays
-    off) so every hop is re-validated against the SSRF guard instead of
-    trusting whatever the server points at next. Factored out so tests can
-    swap in an httpx.MockTransport without touching the network.
-    """
+    """Build the client for one fetch, with redirects left to _follow_redirects
+    so every hop is re-validated. Factored out for httpx.MockTransport."""
     return httpx.Client(
         follow_redirects=False,
         timeout=timeout,
@@ -106,15 +94,14 @@ def _build_client(timeout: float) -> httpx.Client:
 
 
 def _send(client: httpx.Client, url: str) -> httpx.Response:
-    """Send a GET and return the response with its body still unread, so
-    the caller can inspect status and headers before committing memory to
-    whatever the server is sending."""
+    """GET `url`, leaving the body unread so status and headers can be
+    checked before committing memory to it."""
     return client.send(client.build_request("GET", url), stream=True)
 
 
 def _follow_redirects(client: httpx.Client, url: str) -> httpx.Response:
-    """Walk the redirect chain, re-validating each hop, and return the
-    first non-redirect response."""
+    """Walk the redirect chain, re-validating each hop against the SSRF
+    guard, and return the first non-redirect response."""
     response = _send(client, url)
     for _ in range(MAX_REDIRECTS):
         if not response.is_redirect:
@@ -134,12 +121,10 @@ def _follow_redirects(client: httpx.Client, url: str) -> httpx.Response:
 
 
 def _read_capped_body(response: httpx.Response, max_bytes: int) -> str:
-    """Read the response body, aborting as soon as it passes `max_bytes`.
+    """Read the body, stopping as soon as it passes `max_bytes`.
 
-    Streamed in chunks rather than read whole: Content-Length is optional
-    and a hostile server can omit or understate it, so a cap checked after
-    the body is already in memory protects nothing. This stops reading at
-    the limit and drops the connection.
+    Streamed rather than read whole: Content-Length is optional and a
+    hostile server can omit it, so a cap applied afterwards protects nothing.
     """
     declared = response.headers.get("content-length", "")
     if declared.isdigit() and int(declared) > max_bytes:

@@ -1,8 +1,5 @@
-"""Tests for the fetch layer's SSRF, redirect, content-type and size guards.
-
-Everything below the SSRF tests runs against an httpx.MockTransport swapped
-in through fetch._build_client, so the whole redirect/limit surface is
-exercised without touching the network.
+"""The fetch layer's SSRF, redirect, content-type and size guards, run
+against an httpx.MockTransport so nothing touches the network.
 """
 import httpx
 import pytest
@@ -48,11 +45,10 @@ def test_fetch_rejects_unresolvable_host():
 
 @pytest.fixture
 def serve(monkeypatch):
-    """Serve responses from a handler function instead of the network.
+    """Serve responses from a handler instead of the network.
 
-    example.com is treated as a resolvable public host so tests don't need
-    DNS; every other host still goes through the real SSRF check, which is
-    what lets the redirect test below prove an internal hop gets blocked.
+    example.com is treated as public so tests need no DNS; every other host
+    still goes through the real SSRF check.
     """
     real_assert_safe_host = fetch_module._assert_safe_host
 

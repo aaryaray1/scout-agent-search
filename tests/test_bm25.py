@@ -29,9 +29,8 @@ def test_bm25_rarer_term_scores_higher_than_common_term():
         {"content": "widget teleportation error"},
     ]
     index = BM25Index(corpus)
-    # "widget" and "error" appear in every doc (uninformative). A query on
-    # a term unique to one document should score that document meaningfully
-    # higher than a query on a term shared by all of them.
+    # "widget" and "error" are in every doc, so a term unique to one should
+    # score meaningfully higher than one shared by all.
     rare_scores = index.scores("frobnication")
     common_scores = index.scores("widget")
     assert rare_scores[0] > common_scores[0]
@@ -78,11 +77,9 @@ def test_normalize_empty_list():
 
 
 # -- incremental index -------------------------------------------------------
-#
-# The index used to be rebuilt from scratch on every ingest. These cover the
-# add/remove/compact path that replaced that, and the property that matters
-# most: an index reached incrementally has to score identically to one built
-# in a single pass, or retrieval quietly depends on ingest order.
+# The add/remove/compact path that replaced the per-ingest rebuild. The
+# property that matters most: an index reached incrementally must score
+# identically to one built in a single pass.
 
 
 def _docs(*texts):
@@ -123,9 +120,8 @@ def test_removing_a_slot_stops_it_scoring_and_keeps_the_list_aligned():
 
     index.remove_slots([0])
     scores = index.scores("frobnication")
-    # The tombstone still occupies its position: callers hold slot numbers
-    # for every other document, and shifting them here would silently
-    # re-point every one of them at the wrong document.
+    # The tombstone keeps its position: shifting would re-point every slot
+    # the caller holds at the wrong document.
     assert len(scores) == len(CORPUS)
     assert scores[0] == 0.0
 
@@ -179,9 +175,8 @@ def test_compacted_reclaims_tombstones_and_preserves_live_order():
     index = index.compacted()
 
     assert (index.size, index.live_docs, index.tombstones) == (3, 3, 0)
-    # Compaction must leave the survivors in insertion order: Retriever
-    # resets its slot mapping to a plain range afterwards, which is only
-    # correct if that holds.
+    # Survivors stay in insertion order, which is what lets Retriever reset
+    # its mapping to a plain range afterwards.
     survivors = BM25Index([CORPUS[0], CORPUS[2], CORPUS[3]])
     for query in ("widget", "calibration", "sprocket"):
         assert index.scores(query) == pytest.approx(survivors.scores(query))
